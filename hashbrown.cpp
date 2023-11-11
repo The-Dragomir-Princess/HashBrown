@@ -1,5 +1,8 @@
 // Hash Brown
 // Should move functions to header file and inline most of them
+// Idea: would it be faster to use a class, create 1 object, and then call hash func?
+// Would not have to reinitialize a lot of the variables every hash if so. 
+
 #include <stdint.h>
 
 const uint64_t P1 = 0x8ebc6af09c88c6e3;
@@ -8,9 +11,86 @@ const uint64_t P3 = 0x1d8e4e27c47d124f;
 const uint64_t P4 = 0xa0761d6478bd642f;
 const uint64_t P5 = 0x589965cc75374cc3;
 
-uint64_t hashbrown(uint64_t seed, size_t length, void* data) {
-    uint64_t* a;
-    uint64_t* b;
+// TODO: move some (or all) of these to a header file
+/* 
+    Multiplies two 64-bit numbers and returns high and low parts of the 128-bit result
+    Stores the results in the passed in parameters
+*/
+void mult64(const uint64_t a, const uint64_t b, uint64_t *hi_ptr, uint64_t *lo_ptr) {
+    uint64_t a_lo = (uint32_t) a;
+    uint64_t a_hi = a >> 32;
+    uint64_t b_lo = (uint32_t) b;
+    uint64_t b_hi = b >> 32;
+    
+    // Low is just multiplication of a and b (truncates for us)
+    *lo_ptr = a * b;
+    *hi_ptr = (a_hi * b_hi) + ((a_hi * b_lo) >> 32) + ((b_hi * a_lo) >> 32);
+}
+
+/*
+    Mixes the two input integers by multiplying then  
+    XORing the two halves together
+*/
+uint64_t mix(uint64_t a, uint64_t b) {
+    uint64_t *res_lo = new uint64_t;
+    uint64_t *res_hi = new uint64_t;
+    mult64(a, b, res_hi, res_lo);
+
+    return (uint64_t) *res_lo ^ *res_hi;
+}
+
+/*
+    Reads 32 bits in little-endian fashion
+*/
+uint32_t read4(const void *data) {
+    const uint8_t *bytePtr = static_cast<const uint8_t*>(data);
+    
+    uint32_t res = bytePtr[0];
+    res |= static_cast<uint32_t>(bytePtr[1]) << 8;
+    res |= static_cast<uint32_t>(bytePtr[2]) << 16;
+    res |= static_cast<uint32_t>(bytePtr[3]) << 24;
+
+    return res;
+}
+
+/*
+    Reads 64 bits in little-endian fashion
+*/
+uint64_t read8(const void *data) {
+    const uint8_t *bytePtr = static_cast<const uint8_t*>(data);
+    uint64_t res = bytePtr[0];
+
+    for (int i = 1; i < 8; i++) {
+        res |= static_cast<uint64_t>(bytePtr[i]) << (i * 8);
+    }
+
+    return res;
+}
+
+// Rotates input left by specified bits amount
+uint32_t rotLeft64(uint64_t input, unsigned char amount) {
+    return (input << amount) | (input >> (64 - amount));
+}
+
+/*
+    Conducts a round of hashing
+    Uses 4 parallel states of 64-bits each
+*/
+void hash_round(const void *data, uint64_t& state0, uint64_t& state1, uint64_t& state2, uint64_t& state3) {
+    const uint64_t *block = (const uint64_t*) data;
+    state0 = rotLeft64(state0 + block[0] * P4, 31) * P5;
+    state1 = rotLeft64(state1 + block[1] * P4, 31) * P5;
+    state2 = rotLeft64(state2 + block[2] * P4, 31) * P5;
+    state3 = rotLeft64(state3 + block[3] * P4, 31) * P5;
+}
+// |------------------------------------------------------------------------------------| //
+
+/*
+    Hashes small inputs. Length must be < 32 bytes. 
+*/
+uint64_t hashbrownsmall(uint64_t seed, size_t length, void *data) {
+    uint64_t* a = new uint64_t;
+    uint64_t* b = new uint64_t;
 
     seed ^= P1;
 
@@ -46,19 +126,12 @@ uint64_t hashbrown(uint64_t seed, size_t length, void* data) {
         *b = read8(reinterpret_cast<unsigned char*>(data) + (length - 8));
     }
     else if (length <= 24) {
-        *a = (read8(data) * P1) ^ read8(reinterpret_cast<unsigned char*>(data) + 8);
+        *a = read8(data) * P1 ^ read8(reinterpret_cast<unsigned char*>(data) + 8);
         *b = read8(reinterpret_cast<unsigned char*>(data) + (length - 8));
     }
-    else if (length < 32) {
-        // TODO: do something
+    else { // length < 32
         *a = (read8(data) * P1) ^ read8(reinterpret_cast<unsigned char*>(data) + 8);
         *b = read8(reinterpret_cast<unsigned char*>(data) + 16) + read8(reinterpret_cast<unsigned char*>(data) + (length - 8));
-    }
-    else {
-        // TODO: parallel hashing, inspired by xxhash
-        // return hashbrownbig(seed, length, input)
-        *a = 123;
-        *b = 456;
     }
 
     uint64_t first_mix = mix(*a ^ P2, *b ^ seed);
@@ -92,90 +165,20 @@ uint64_t hashbrownbig(uint64_t seed, size_t length, void *input) {
     res = (res ^ state[2]) * P1 + P5;
     res = (res ^ state[3]) * P1 + P5;
 
-    // Deal with remainder bytes
-    // TODO: cleanup this "recursive" call. This won't loop b/c length is guarenteed 
-    // to be < 32, thus one of the if-statements will executed instead.
-    uint64_t remainder = hashbrown(seed, length % 32, (void *) data);
+    // Deal with remainder bytes. This last part *might* be slow. 
+    // If so, will need to figure out a way to speed it up. 
+    uint64_t remainder = hashbrownsmall(seed, length % 32, (void *) data);
 
     remainder ^= (remainder >> 33) * P2;
     res = mix(res, remainder);
     return res;
 }
 
-// Rotates input left by specified bits amount
-uint32_t rotLeft64(uint64_t input, unsigned char amount) {
-    return (input << amount) | (input >> (64 - amount));
-}
-
-/*
-    Conducts a round of hashing
-    Uses 4 parallel states of 64-bits each
-*/
-void hash_round(const void *data, uint64_t& state0, uint64_t& state1, uint64_t& state2, uint64_t& state3) {
-    const uint64_t *block = (const uint64_t*) data;
-    state0 = rotLeft64(state0 + block[0] * P4, 31) * P5;
-    state1 = rotLeft64(state1 + block[1] * P4, 31) * P5;
-    state2 = rotLeft64(state2 + block[2] * P4, 31) * P5;
-    state3 = rotLeft64(state3 + block[3] * P4, 31) * P5;
-}
-
-/* 
-    Multiplies two 64-bit numbers and returns high and low parts of the 128-bit result
-    Stores the results in the passed in parameters
-*/
-void mult64(const uint64_t a, const uint64_t b, uint64_t *hi_ptr, uint64_t *lo_ptr) {
-    uint64_t a_lo = (uint32_t) a;
-    uint64_t a_hi = a >> 32;
-    uint64_t b_lo = (uint32_t) b;
-    uint64_t b_hi = b >> 32;
-
-    // uint64_t a_x_b_hi =  a_hi * b_hi;
-    // uint64_t a_x_b_mid = a_hi * b_lo;
-    // uint64_t b_x_a_mid = b_hi * a_lo;
-    // uint64_t a_x_b_lo =  a_lo * b_lo;
-    // *hi_ptr = a_x_b_hi + (a_x_b_mid >> 32) + (b_x_a_mid >> 32);
-    
-    // Low is just multiplication of a and b (truncates for us)
-    *lo_ptr = a * b;
-    *hi_ptr = (a_hi * b_hi) + ((a_hi * b_lo) >> 32) + ((b_hi * a_lo) >> 32);
-}
-
-/*
-    Mixes the two input integers by multiplying then  
-    XORing the two halves together
-*/
-uint64_t mix(uint64_t a, uint64_t b) {
-    uint64_t *res_lo;
-    uint64_t *res_hi;
-    mult64(a, b, res_hi, res_lo);
-
-    return (uint64_t) *res_lo ^ *res_hi;
-}
-
-/*
-    Reads 32 bits in little-endian fashion
-*/
-uint32_t read4(const void* data) {
-    const uint8_t* bytePtr = static_cast<const uint8_t*>(data);
-    
-    uint32_t res = bytePtr[0];
-    res |= static_cast<uint32_t>(bytePtr[1]) << 8;
-    res |= static_cast<uint32_t>(bytePtr[2]) << 16;
-    res |= static_cast<uint32_t>(bytePtr[3]) << 24;
-
-    return res;
-}
-
-/*
-    Reads 64 bits in little-endian fashion
-*/
-uint64_t read8(const void* data) {
-    const uint8_t* bytePtr = static_cast<const uint8_t*>(data);
-    uint64_t res = bytePtr[0];
-
-    for (int i = 1; i < 8; i++) {
-        res |= static_cast<uint64_t>(bytePtr[i]) << (i * 8);
+// Main frontend function for hashing
+uint64_t hashbrown(uint64_t seed, size_t length, void* data) {
+    if (length < 32) {
+        return hashbrownsmall(seed, length, data);
     }
 
-    return res;
+    return hashbrownbig(seed, length, data);
 }
