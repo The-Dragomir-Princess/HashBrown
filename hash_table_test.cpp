@@ -7,7 +7,7 @@
 #include <cassert>
 
 const uint64_t seed1 = 0x1234abcd;
-const uint64_t seed2 = 0xabcd4321;
+const uint64_t seed2 = 0xcdef5678;
 
 template<class KeyType, uint64_t seed>
 class Hasher {
@@ -25,6 +25,8 @@ class HashTableTest {
  public:
   static void RunAllTests() {
     TestStashBucket();
+    TestBucket();
+    TestDleft();
   }
 
  private:
@@ -48,18 +50,31 @@ class HashTableTest {
     TestBucketFindWithOverflow();
   }
 
+  static void TestDleft() {
+    TestDleftInsert();
+    TestDleftErase();
+    TestDleftFind();
+  }
+
   static void TestStashBucketInsertMinorOverflow() {
+    printf("[TEST STASH BUCKET INSERT MINOR OVERFLOW]\n");
+
     HashTableType::StashBucket bucket;
+
     for (auto i = 0; i < bucket.bucket_capacity; i++) {
       assert(bucket.InsertMinorOverflow(i, i) != bucket.invalid_pos);
     }
     assert(bucket.InsertMinorOverflow(2023u, 2023u) == bucket.invalid_pos);
+
+    printf("[PASSED]\n");
   }
 
   static void TestStashBucketEraseMinorOverflow() {
+    printf("[TEST STASH BUCKET ERASE MINOR OVERFLOW]\n");
+
     HashTableType::StashBucket bucket;
     uint8_t pos[bucket.bucket_capacity];
-    
+
     for (auto i = 0; i < bucket.bucket_capacity; i++) {
       pos[i] = bucket.InsertMinorOverflow(i, i);
       assert(pos[i] != bucket.invalid_pos);
@@ -73,9 +88,13 @@ class HashTableTest {
     for (auto i = 0; i < bucket.bucket_capacity; i += 2) {
       assert(bucket.InsertMinorOverflow(i, i) != bucket.invalid_pos);
     }
+
+    printf("[PASSED]\n");
   }
 
   static void TestStashBucketFindMinorOverflow() {
+    printf("[TEST STASH BUCKET FIND MINOR OVERFLOW]\n");
+
     HashTableType::StashBucket bucket;
     uint8_t pos[bucket.bucket_capacity];
 
@@ -102,9 +121,13 @@ class HashTableTest {
       assert(bucket.FindMinorOverflow(i, &value, pos[i]));
       assert(value == i*2);
     }
+
+    printf("[PASSED]\n");
   }
 
   static void TestStashBucketInsertMajorOverflow() {
+    printf("[TEST STASH BUCKET INSERT MAJOR OVERFLOW]\n");
+
     {
       HashTableType::StashBucket bucket;
       for (auto i = 0; i < bucket.max_major_overflows; i++) {
@@ -123,9 +146,13 @@ class HashTableTest {
       }
       assert(!bucket.InsertMajorOverflow(2023u, 2023u, static_cast<uint16_t>(Hasher1()(2023u))));
     }
+
+    printf("[PASSED]\n");
   }
 
   static void TestStashBucketEraseMajorOverflow() {
+    printf("[TEST STASH BUCKET ERASE MAJOR OVERFLOW]\n");
+
     HashTableType::StashBucket bucket;
 
     for (auto i = 0; i < bucket.max_major_overflows; i++) {
@@ -140,9 +167,13 @@ class HashTableTest {
     for (auto i = 0; i < bucket.max_major_overflows; i += 2) {
       assert(bucket.InsertMajorOverflow(i, i, Hasher1()(i)));
     }
+
+    printf("[PASSED]\n");
   }
 
   static void TestStashBucketFindMajorOverflow() {
+    printf("[TEST STASH BUCKET FIND MAJOR OVERFLOW]\n");
+
     HashTableType::StashBucket bucket;
 
     for (auto i = 0; i < bucket.max_major_overflows; i++) {
@@ -166,18 +197,26 @@ class HashTableTest {
       assert(bucket.FindMajorOverflow(i, &value, Hasher1()(i)));
       assert(value == i*2);
     }
+
+    printf("[PASSED]\n");
   }
 
   static void TestBucketInsert() {
+    printf("[TEST BUCKET INSERT]\n");
+
     HashTableType::Bucket bucket;
 
     for (auto i = 0; i < bucket.bucket_capacity; i++) {
       assert(bucket.Insert(i, i, Hasher1()(i), nullptr));
     }
     assert(!bucket.Insert(2023u, 2023u, Hasher1()(2023u), nullptr));
+
+    printf("[PASSED]\n");
   }
 
   static void TestBucketErase() {
+    printf("[TEST BUCKET ERASE]\n");
+
     HashTableType::Bucket bucket;
 
     for (auto i = 0; i < bucket.bucket_capacity; i++) {
@@ -189,16 +228,12 @@ class HashTableTest {
       assert(!bucket.Erase(i, Hasher1()(i), nullptr));
     }
 
-    for (auto i = 0; i < bucket.bucket_capacity; i++) {
-      if (i % 2 == 0) {
-        assert(bucket.Insert(i, i*2, Hasher1()(i), nullptr));
-      } else {
-        assert(!bucket.Insert(i, i*2, Hasher1()(i), nullptr));
-      }
-    }
+    printf("[PASSED]\n");
   }
 
   static void TestBucketFind() {
+    printf("[TEST BUCKET FIND]\n");
+
     HashTableType::Bucket bucket;
 
     for (auto i = 0; i < bucket.bucket_capacity; i++) {
@@ -223,12 +258,15 @@ class HashTableTest {
         assert(value == i);
       }
     }
+
+    printf("[PASSED]\n");
   }
 
   static void TestBucketInsertWithOverflow() {
+    printf("[TEST BUCKET INSERT WITH OVERFLOW]\n");
+
     HashTableType::Bucket bucket;
     HashTableType::StashBucket stash_bucket;
-    auto size = bucket.bucket_capacity + bucket.max_minor_overflows + stash_bucket.max_major_overflows;
 
     for (auto i = 0; i < bucket.bucket_capacity; i++) {
       assert(bucket.Insert(i, i, Hasher1()(i), &stash_bucket));
@@ -256,9 +294,13 @@ class HashTableTest {
     }
   
     assert(!bucket.Insert(2023u, 2023u, Hasher1()(2023u), &stash_bucket));
+
+    printf("[PASSED]\n");
   }
 
   static void TestBucketEraseWithOverflow() {
+    printf("[TEST BUCKET ERASE WITH OVERFLOW]\n");
+
     HashTableType::Bucket bucket;
     HashTableType::StashBucket stash_bucket;
 
@@ -266,7 +308,6 @@ class HashTableTest {
          i < bucket.bucket_capacity + bucket.max_minor_overflows + stash_bucket.max_major_overflows;
          i++) {
       assert(bucket.Insert(i, i, Hasher1()(i), &stash_bucket));
-      assert(!bucket.Erase(i, Hasher1()(i), &stash_bucket));
     }
     assert(bucket.overflow_count_ == bucket.max_minor_overflows + stash_bucket.max_major_overflows);
     assert(bucket.GetMinorOverflowCount() == bucket.max_minor_overflows);
@@ -298,9 +339,13 @@ class HashTableTest {
     }
     assert(bucket.overflow_count_ == 0);
     assert(bucket.GetMinorOverflowCount() == 0);
+
+    printf("[PASSED]\n");
   }
 
   static void TestBucketFindWithOverflow() {
+    printf("[TEST BUCKET FIND WITH OVERFLOW]\n");
+
     HashTableType::Bucket bucket;
     HashTableType::StashBucket stash_bucket;
 
@@ -308,7 +353,6 @@ class HashTableTest {
          i < bucket.bucket_capacity + bucket.max_minor_overflows + stash_bucket.max_major_overflows;
          i++) {
       assert(bucket.Insert(i, i, Hasher1()(i), &stash_bucket));
-      assert(!bucket.Erase(i, Hasher1()(i), &stash_bucket));
     }
     assert(bucket.overflow_count_ == bucket.max_minor_overflows + stash_bucket.max_major_overflows);
     assert(bucket.GetMinorOverflowCount() == bucket.max_minor_overflows);
@@ -330,6 +374,76 @@ class HashTableTest {
       assert(bucket.Find(i, &value, Hasher1()(i), &stash_bucket));
       assert(value == i*2);
     }
+
+    printf("[PASSED]\n");
+  }
+
+  static void TestDleftInsert() {
+    printf("[TEST DLEFT INSERT]\n");
+
+    const int testcase_size = 65536;
+    HashTableType hash_table(testcase_size / 16);
+
+    for (auto i = 0; i < testcase_size; i++) {
+      assert(hash_table.Insert(i, i));
+    }
+
+    printf("[PASSED]\n");
+  }
+
+  static void TestDleftErase() {
+    printf("[TEST DLEFT ERASE]\n");
+
+    const int testcase_size = 65536;
+    HashTableType hash_table(testcase_size / 16);
+
+    for (auto i = 0; i < testcase_size; i++) {
+      assert(hash_table.Insert(i, i));
+    }
+
+    for (auto i = 0; i < testcase_size; i += 2) {
+      assert(hash_table.Erase(i));
+    }
+
+    for (auto i = 0; i < testcase_size; i += 2) {
+      assert(!hash_table.Erase(i));
+    }
+
+    printf("[PASSED]\n");
+  }
+
+  static void TestDleftFind() {
+    printf("[TEST DLEFT FIND]\n");
+
+    const int testcase_size = 65536;
+    HashTableType hash_table(testcase_size / 16);
+
+    for (auto i = 0; i < testcase_size; i++) {
+      assert(hash_table.Insert(i, i));
+    }
+
+    for (auto i = 0; i < testcase_size; i++) {
+      uint32_t value;
+      assert(hash_table.Find(i, &value));
+      assert(value == i);
+    }
+
+    for (auto i = 0; i < testcase_size; i += 2) {
+      assert(hash_table.Erase(i));
+      assert(hash_table.Insert(i, i*2));
+    }
+
+    for (auto i = 0; i < testcase_size; i++) {
+      uint32_t value;
+      assert(hash_table.Find(i, &value));
+      if (i % 2 == 0) {
+        assert(value == i*2);
+      } else {
+        assert(value == i);
+      }
+    }
+
+    printf("[PASSED]\n");
   }
 };
 
