@@ -1,3 +1,4 @@
 .vscode/
 myprog
-
+xxhash.c
+xxhash.h

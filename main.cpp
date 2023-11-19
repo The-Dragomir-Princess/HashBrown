@@ -3,8 +3,11 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
-#include "hashbrown.cpp"
+#include <chrono>
+#include "hashbrown.h"
+#include "xxhash.c"
 using namespace std;
+using namespace std::chrono;
 
 void simple_test_run()
 {
@@ -47,10 +50,13 @@ void test_ips(string path)
 
     // Let's hash
     uint64_t seed = 18446744073709551557;
+    auto start = high_resolution_clock::now();
     for (auto num_ptr : integers) {
         uint64_t hashed_num = hashbrown(seed, 32, num_ptr);
+        //uint64_t hashed_num = XXH64(num_ptr, 32, seed);
         table[hashed_num % table_size].push_back(hashed_num);
     }
+    cout << "Computing hashes took " << duration_cast<milliseconds>(high_resolution_clock::now() - start).count() << " ms" << endl;
 
     // Let's find some statistics
     // Note: we round up b/c to allow for remainder items
@@ -69,6 +75,6 @@ void test_ips(string path)
 
 int main()
 {
-    test_ips("data/random_ips.txt");
+    test_ips("data/random_macs.txt");
     return 0;
 }
