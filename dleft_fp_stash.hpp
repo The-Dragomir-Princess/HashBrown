@@ -68,7 +68,14 @@ class DleftFpStash {
 
 	auto find(const K &key, V &value) const -> bool { return Find(key, &value, H1()(key), H2()(key)); }
 
-	void clear() {  }
+	void clear() {
+		for (size_t i = 0; i < num_buckets_; i++) {
+			buckets_[i].Clear();
+		}
+		for (size_t i = 0; i < num_stash_buckets_; i++) {
+			stash_buckets_[i].Clear();
+		}
+	}
 
 	void reserve(size_t size) { Resize(size); }
 
