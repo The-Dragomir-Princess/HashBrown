@@ -439,8 +439,6 @@ auto DLEFT_TYPE::Resize(size_t new_size) -> bool {
 	StashBucket *old_stash_buckets = stash_buckets_;
 	size_t new_capacity = ROUNDUP_POWER_2(new_size / Bucket::bucket_capacity);
 
-	printf("%lu %lu %lu\n", size_, new_size, new_capacity);
-
 	if (num_buckets_ == new_capacity) {
 		return true;
 	}
