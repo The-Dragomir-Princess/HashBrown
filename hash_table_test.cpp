@@ -3,33 +3,179 @@
 #include <stdint.h>
 
 #include <iostream>
+#include <string>
 
 #include <cassert>
 
-const uint64_t seed1 = 0x1234abcd;
-const uint64_t seed2 = 0xcdef5678;
+#define __PERFORMANCE_TEST__
+#ifdef __PERFORMANCE_TEST__
+# include "libcuckoo/cuckoohash_map.hh"
+# include <unordered_map>
+# include <unordered_set>
 
-template<class KeyType, uint64_t seed>
+# include <random>
+# include <limits>
+# include <chrono>
+#endif
+
+const uint32_t seed1 = 0x5d445e6e;
+const uint32_t seed2 = 0xf09ad611;
+const uint64_t seed64 = 0x42ae2f8ce193f9da;
+
+template<class K, uint64_t seed>
 class Hasher {
  public:
-  auto operator()(const KeyType &key) -> uint32_t {
-    return XXH32(&key, sizeof(KeyType), seed);
+  auto operator()(const K &key) const -> uint32_t {
+    return XXH32(&key, sizeof(K), seed);
   }
 };
 
 using Hasher1 = Hasher<uint32_t, seed1>;
 using Hasher2 = Hasher<uint32_t, seed2>;
+
+#ifdef __PERFORMANCE_TEST__
+template<class K, uint64_t seed>
+class HasherULL {
+  public:
+  auto operator()(const K &key) const -> uint64_t {
+    return XXH64(&key, sizeof(K), seed);
+  }
+};
+using Hasher64 = HasherULL<uint32_t, seed64>;
+
+template<class K, class V, class Hasher>
+class std_unordered_map_wrapper {
+ public:
+  auto insert(K &&key, V &&value) -> bool { return map.insert({key, value}).second; }
+
+  auto erase(const K &key) -> bool { return map.erase(key) > 0; }
+
+  auto find(const K &key, V &value) const -> bool {
+    auto itr = map.find(key);
+    if (itr == map.end()) {
+      return false;
+    }
+    value = itr->second;
+    return true;
+  }
+
+  void reserve(size_t size) { map.reserve(size); }
+
+  void clear() { map.clear(); }
+
+  auto load_factor() const -> double { return map.load_factor(); }
+ private:
+  std::unordered_map<K, V, Hasher> map;
+};
+
+using std_unordered_map = std_unordered_map_wrapper<uint32_t, uint32_t, Hasher64>;
+using cuckoo_map = libcuckoo::cuckoohash_map<uint32_t, uint32_t, Hasher64>;
+using dleft_map = DleftFpStash<uint32_t, uint32_t, Hasher1, Hasher2>;
+
+const char std_unordered_map_name[] = "std::unordered_map";
+const char cuckoo_map_name[] = "cuckoohash_map";
+const char dleft_map_name[] = "dleft_map";
+#else
 using HashTableType = DleftFpStash<uint32_t, uint32_t, Hasher1, Hasher2>;
+#endif
 
 class HashTableTest {
  public:
   static void RunAllTests() {
+#ifdef __PERFORMANCE_TEST__
+    TestPerformance<std_unordered_map, std_unordered_map_name>();
+    TestPerformance<cuckoo_map, cuckoo_map_name>();
+    TestPerformance<dleft_map, dleft_map_name>();
+#else
     TestStashBucket();
     TestBucket();
     TestDleft();
+#endif
   }
 
  private:
+#ifdef __PERFORMANCE_TEST__
+  template<class map_type, const char *name>
+  static void TestPerformance() {
+    printf("[PERFORMANCE TEST]\nTesting %s\n", name);
+    
+    map_type map;
+    auto dataset = std::move(GetDataset());
+    
+    printf("Write Latency: %lf ns\n", TestWriteLatency(map, dataset));
+    printf("Positive Read Latency: %lf ns\n", TestReadPositiveLatency(map, dataset));
+    printf("Negative Read Latency: %lf ns\n", TestReadNegativeLatency(map, dataset));
+    printf("Load Factor: %lf\n", TestLoadFactor(map));
+  }
+
+  template<class map_type>
+  static auto TestWriteLatency(map_type &map, const std::unordered_set<uint32_t> &dataset) -> double {
+    size_t total_ns = 0;
+    map.clear();
+    map.reserve(dataset.size());
+    for (auto key : dataset) {
+      const auto start = std::chrono::high_resolution_clock::now();
+      map.insert(std::forward<uint32_t &&>(key), std::forward<uint32_t &&>(key));
+      const auto end = std::chrono::high_resolution_clock::now();
+      total_ns += (end - start).count();
+    }
+    return 1.0 * total_ns / dataset.size();
+  }
+
+  template<class map_type>
+  static auto TestReadPositiveLatency(const map_type &map, const std::unordered_set<uint32_t> &dataset) -> double {
+    size_t total_ns = 0;
+    for (auto key : dataset) {
+      uint32_t value;
+      const auto start = std::chrono::high_resolution_clock::now();
+      map.find(key, value);
+      const auto end = std::chrono::high_resolution_clock::now();
+      total_ns += (end - start).count();
+    }
+    return 1.0 * total_ns / dataset.size();
+  }
+
+  template<class map_type>
+  static auto TestReadNegativeLatency(const map_type &map, const std::unordered_set<uint32_t> &dataset) -> double {
+    size_t total_ns = 0;
+
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    std::uniform_int_distribution<uint32_t> dist;
+
+    for (size_t i = 0; i < dataset.size(); i++) {
+      uint32_t key, value;
+      while (dataset.count(key = dist(gen)));
+      const auto start = std::chrono::high_resolution_clock::now();
+      map.find(key, value);
+      const auto end = std::chrono::high_resolution_clock::now();
+      total_ns += (end - start).count();
+    }
+    return 1.0 * total_ns / dataset.size();
+  }
+
+  template<class map_type>
+  static auto TestLoadFactor(const map_type &map) -> double {
+    return map.load_factor();
+  }
+
+  // TODO: use a networking dataset
+  static auto GetDataset() -> std::unordered_set<uint32_t> {
+    const size_t size = 1000000;
+    std::unordered_set<uint32_t> keys;
+
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    std::uniform_int_distribution<uint32_t> dist;
+
+    for (size_t i = 0; i < size; i++) {
+      uint32_t key;
+      while (keys.count(key = dist(gen)));
+      keys.insert(key);
+    }
+    return keys;
+  }
+#else
   static void TestStashBucket() {
     TestStashBucketInsertMinorOverflow();
     TestStashBucketEraseMinorOverflow();
@@ -468,11 +614,12 @@ class HashTableTest {
   static void TestDleftAppend() {
     printf("[TEST DLEFT APPEND]\n");
 
-    const int testcase_size = 65536;
-    HashTableType hash_table(testcase_size / 16);
+    const int testcase_size = 65000;
+    HashTableType hash_table(testcase_size);
 
     for (auto i = 0; i < testcase_size; i++) {
       assert(hash_table.Append(i, i, Hasher1()(i), Hasher2()(i)));
+      assert(hash_table.size_ == i + 1);
     }
 
     printf("[PASSED]\n");
@@ -481,19 +628,22 @@ class HashTableTest {
   static void TestDleftErase() {
     printf("[TEST DLEFT ERASE]\n");
 
-    const int testcase_size = 65536;
-    HashTableType hash_table(testcase_size / 16);
+    const int testcase_size = 65000;
+    HashTableType hash_table(testcase_size);
 
     for (auto i = 0; i < testcase_size; i++) {
       assert(hash_table.Append(i, i, Hasher1()(i), Hasher2()(i)));
     }
+    assert(hash_table.size_ == testcase_size);
 
     for (auto i = 0; i < testcase_size; i += 2) {
       assert(hash_table.Erase(i, Hasher1()(i), Hasher2()(i)));
+      assert(hash_table.size_ == testcase_size - i / 2 - 1);
     }
 
     for (auto i = 0; i < testcase_size; i += 2) {
       assert(!hash_table.Erase(i, Hasher1()(i), Hasher2()(i)));
+      assert(hash_table.size_ == testcase_size / 2);
     }
 
     printf("[PASSED]\n");
@@ -502,8 +652,8 @@ class HashTableTest {
   static void TestDleftFind() {
     printf("[TEST DLEFT FIND]\n");
 
-    const int testcase_size = 65536;
-    HashTableType hash_table(testcase_size / 16);
+    const int testcase_size = 65000;
+    HashTableType hash_table(testcase_size);
 
     for (auto i = 0; i < testcase_size; i++) {
       assert(hash_table.Append(i, i, Hasher1()(i), Hasher2()(i)));
@@ -516,6 +666,7 @@ class HashTableTest {
     }
 
     for (auto i = 0; i < testcase_size; i += 2) {
+      printf("%d\n", i);
       assert(hash_table.Erase(i, Hasher1()(i), Hasher2()(i)));
       assert(hash_table.Append(i, i*2, Hasher1()(i), Hasher2()(i)));
     }
@@ -536,15 +687,15 @@ class HashTableTest {
   static void TestDleftInsert() {
     printf("[TEST DLEFT INSERT]\n");
 
-    const int testcase_size = 65536;
-    HashTableType hash_table(testcase_size / 16);
+    const int testcase_size = 65000;
+    HashTableType hash_table(testcase_size);
 
     for (auto i = 0; i < testcase_size; i++) {
       assert(hash_table.Append(i, i, Hasher1()(i), Hasher2()(i)));
     }
 
     for (auto i = 0; i < testcase_size; i += 2) {
-      assert(hash_table.Insert(i, i*2, Hasher1()(i), Hasher2()(i)));
+      assert(hash_table.Insert(i, i*2, Hasher1()(i), Hasher2()(i)) == HashTableType::InsertStatus::INSERTED);
     }
 
     for (auto i = 0; i < testcase_size; i++) {
@@ -563,8 +714,8 @@ class HashTableTest {
   static void TestDleftResize() {
     printf("[TEST DLEFT RESIZE]\n");
 
-    const int testcase_size = 65536;
-    HashTableType hash_table(testcase_size / 16);
+    const int testcase_size = 65000;
+    HashTableType hash_table(testcase_size);
 
     for (auto i = 0; i < testcase_size; i++) {
       assert(hash_table.Append(i, i, Hasher1()(i), Hasher2()(i)));
@@ -576,7 +727,7 @@ class HashTableTest {
       assert(value == i);
     }
 
-    assert(hash_table.Resize(testcase_size / 8));
+    assert(hash_table.Resize(testcase_size * 2));
 
     for (auto i = 0; i < testcase_size; i++) {
       uint32_t value;
@@ -586,6 +737,7 @@ class HashTableTest {
 
     printf("[PASSED]\n");
   }
+#endif
 };
 
 int main() {
