@@ -86,9 +86,9 @@ class HashTableTest {
  public:
   static void RunAllTests() {
 #ifdef __PERFORMANCE_TEST__
-    // TestPerformance<std_unordered_map, std_unordered_map_name>();
-    // TestPerformance<cuckoo_map, cuckoo_map_name>();
-    // TestPerformance<dleft_map, dleft_map_name>();
+    TestPerformance<std_unordered_map, std_unordered_map_name>();
+    TestPerformance<cuckoo_map, cuckoo_map_name>();
+    TestPerformance<dleft_map, dleft_map_name>();
 
     TestMaxLoadFactor();
 #else
@@ -218,6 +218,7 @@ class HashTableTest {
 
   static void TestMaxLoadFactor() {
     dleft_map map(1000000);
+    size_t bucket_total{0}, stash_bucket_total{0};
 
     uint32_t key = 0;
     while (map.Append(std::forward<uint32_t>(key), std::forward<uint32_t>(key), Hasher1()(key), Hasher2()(key))) {
@@ -227,18 +228,24 @@ class HashTableTest {
     std::map<size_t, size_t> bucket_distribution, stash_bucket_distribution;
     for (size_t i = 0; i < map.num_buckets_; i++) {
       bucket_distribution[map.buckets_[i].GetTotal()]++;
+      bucket_total += map.buckets_[i].GetSize();
     }
     for (size_t i = 0; i < map.num_stash_buckets_; i++) {
       stash_bucket_distribution[map.stash_buckets_[i].GetSize()]++;
+      stash_bucket_total += map.stash_buckets_[i].GetSize();
     }
+
+    printf("Bucket Distribution:\n");
     for (auto &p : bucket_distribution) {
       printf("%lu:%lu,", p.first, p.second);
     }
-    printf("\n");
+    printf("\nStash Bucket Distribution:\n");
     for (auto &p : stash_bucket_distribution) {
       printf("%lu:%lu,", p.first, p.second);
     }
-    printf("\n");
+    printf("\nBucket Load Factor: %lf, Stash Bucket Load Factor: %lf\n",
+           1.0 * bucket_total / map.BucketCapacity(),
+           1.0 * stash_bucket_total / map.StashBucketCapacity());
   }
 #else
   static void TestStashBucket() {

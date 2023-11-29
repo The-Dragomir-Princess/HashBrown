@@ -72,9 +72,16 @@
 #include <cstring>
 
 #define __TEST_DLEFT__
+// #define __DEBUG_DLEFT__
+
+#ifdef __DEBUG_DLEFT__
+# define DEBUG_DLEFT(foo) foo
+#else
+# define DEBUG_DLEFT(foo)
+#endif
 
 // #define __COUNT_FALSE_POSITIVES__
-#define __COUNT_OVERFLOWS__
+// #define __COUNT_OVERFLOWS__
 
 #ifdef __COUNT_FALSE_POSITIVES__
 static uint64_t false_positive{0};
@@ -87,7 +94,7 @@ static uint64_t major_overflows{0};
 
 #define CACHELINE_SIZE (64)
 
-#define BUCKET_STASH_BUCKET_RATIO (256)
+#define BUCKET_STASH_BUCKET_RATIO (1024)
 
 #define MAX_LOAD_FACTOR_100 (95)
 
@@ -98,6 +105,10 @@ static uint64_t major_overflows{0};
 #define GET_BIT(bits, n)   (bits & (1ull << (n)))
 #define SET_BIT(bits, n)   (bits |= (1ull << (n)))
 #define CLEAR_BIT(bits, n) (bits &= ~(1ull << (n)))
+
+#define GET_BIT_256(bits, n)   (bits[n/64] & (1ull << (n%64)))
+#define SET_BIT_256(bits, n)   (bits[n/64] |= (1ull << (n%64)))
+#define CLEAR_BIT_256(bits, n) (bits[n/64] &= ~(1ull << (n%64)))
 
 #define FINGERPRINT8(hash)  (static_cast<uint8_t>(hash))
 #define FINGERPRINT16(hash) (static_cast<uint16_t>(hash))
@@ -254,15 +265,15 @@ class DleftFpStash {
   };
 
   struct StashBucket {
-    static constexpr size_t header_size = 32;
+    static constexpr size_t header_size = 40;
     static constexpr int max_major_overflows = 2;
-    static constexpr int bucket_capacity = 64;
+    static constexpr int bucket_capacity = 255;
 		static constexpr uint8_t invalid_pos = 0xff;
 
-    // header (14 B)
-    uint16_t fingerprints_[max_major_overflows];  // fingerprints for major overflows
-		uint8_t position_[max_major_overflows];       // positions of each major overflow in stash bucket
-    uint64_t validity_{0};                        // validity bitmap for each overflow key in stash bucket
+    // header (40 B)
+    uint16_t fingerprints_[max_major_overflows];            // fingerprints for major overflows
+		uint8_t  position_[max_major_overflows];                // positions of each major overflow in stash bucket
+    uint64_t validity_[ROUND_UP(bucket_capacity, 64)] {0};  // validity bitmap for each overflow key in stash bucket
 
 		// key-value pairs
     Tuple tuples_[bucket_capacity];
@@ -290,10 +301,24 @@ class DleftFpStash {
 
     auto FindMinorOverflow(const K &, V *, uint8_t) const -> bool;
 
-		void Clear() { validity_ = 0; memset(position_, invalid_pos, sizeof(position_)); }
+		void Clear() { memset(validity_, 0, sizeof(validity_)); memset(position_, invalid_pos, sizeof(position_)); }
 
 		// Returns the number of valid overflow keys in bucket (either major or minor)
-		auto GetSize() const -> uint8_t { return __builtin_popcountll(validity_); };
+		auto GetSize() const -> uint8_t {
+			return __builtin_popcountll(validity_[0]) + __builtin_popcountll(validity_[1])
+						 + __builtin_popcountll(validity_[2]) + __builtin_popcountll(validity_[3]);
+		};
+
+		auto FindFreeSlot() const -> uint8_t {
+		 	if (~validity_[0] != 0) {
+				return __builtin_ctzll(~validity_[0]);
+			} else if (~validity_[1] != 0) {
+				return 64 + __builtin_ctzll(~validity_[1]);
+			} else if (~validity_[2] != 0) {
+				return 128 + __builtin_ctzll(~validity_[2]);
+			}
+			return 192 + __builtin_ctzll(~validity_[3]);
+		}
   };
 
 	enum class InsertStatus { INSERTED, EXISTED, FAILED };
@@ -437,7 +462,10 @@ auto DLEFT_TYPE::TryInsert(K &&key, V &&value, uint16_t idx, uint32_t hash) -> b
 		}
 		bucket->SetStashBucketNum(min_stash_num);
 		assert(bucket->GetStashBucketNum() == min_stash_num);
-		printf("Bucket %d bound with stash bucket %lu(%d)\n", idx, bucket->GetStashBucketIndex(idx, num_stash_buckets_), min_stash_num);
+		DEBUG_DLEFT(
+			printf("Bucket %d bound with stash bucket %lu(%d)\n", idx,
+						 bucket->GetStashBucketIndex(idx, num_stash_buckets_), min_stash_num);
+		)
 	}
 
 	// Retry insertion with stash bucket
@@ -587,7 +615,6 @@ auto DLEFT_TYPE::Resize(size_t new_size) -> bool {
 	}
 
 	if (new_capacity > (1 << 16)) {
-		printf("%lu %lu\n", size(), capacity());
 		printf("error: table is too large\n");
 	 #ifdef __COUNT_OVERFLOWS__
 		double bucket_lf = 1.0 * (this->size() - minor_overflows - major_overflows) / BucketCapacity();
@@ -617,7 +644,7 @@ auto DLEFT_TYPE::Resize(size_t new_size) -> bool {
 	}
 	for (size_t i = 0; i < old_num_stash_buckets; i++) {  // Iterate over stash buckets and rehash the keys
 		for (auto j = 0; j < StashBucket::bucket_capacity; j++) {
-			if (!GET_BIT(old_stash_buckets[i].validity_, j)) {
+			if (!GET_BIT_256(old_stash_buckets[i].validity_, j)) {
 				continue;
 			}
 			auto &key = old_stash_buckets[i].tuples_[j].key;
@@ -698,9 +725,11 @@ auto DLEFT_TYPE::Bucket::Append(K &&key, V &&value, uint32_t hash, StashBucket *
 		overflow_fp_[idx] = FINGERPRINT16(hash);
 		overflow_pos_[idx] = pos;
 		SET_BIT(overflow_info_, idx);
-		printf("Minor overflow from bucket %ld to stash bucket %ld\n",
-					 this - reinterpret_cast<Bucket *>(buckets),
-					 stash_bucket - reinterpret_cast<StashBucket *>(stash_buckets));
+		DEBUG_DLEFT(
+			printf("Minor overflow from bucket %ld to stash bucket %ld\n",
+					 	 this - reinterpret_cast<Bucket *>(buckets),
+					 	 stash_bucket - reinterpret_cast<StashBucket *>(stash_buckets));
+		)
 
 		return true;
 	}
@@ -708,9 +737,11 @@ auto DLEFT_TYPE::Bucket::Append(K &&key, V &&value, uint32_t hash, StashBucket *
 	// Minor overflow slots used up; Insert as a major overflow
 	if (stash_bucket->AppendMajorOverflow(std::forward<K>(key), std::forward<V>(value), hash)) {
 		overflow_count_++;
-		printf("Major overflow from bucket %ld to stash bucket %ld\n",
-					 this - reinterpret_cast<Bucket *>(buckets),
-					 stash_bucket - reinterpret_cast<StashBucket *>(stash_buckets));
+		DEBUG_DLEFT(
+			printf("Major overflow from bucket %ld to stash bucket %ld\n",
+					 	 this - reinterpret_cast<Bucket *>(buckets),
+					 	 stash_bucket - reinterpret_cast<StashBucket *>(stash_buckets));
+		)
 		return true;
 	}
 	return false;
@@ -728,14 +759,14 @@ auto DLEFT_TYPE::Bucket::Erase(const K &key, uint32_t hash, StashBucket *stash_b
 		return true;
 
 	 case TupleStatus::MINOR_OVERFLOW:
-	 	CLEAR_BIT(stash_bucket->validity_, overflow_pos_[pos]);
+	 	CLEAR_BIT_256(stash_bucket->validity_, overflow_pos_[pos]);
 	 	CLEAR_BIT(overflow_info_, pos);
 		overflow_count_--;
 		// TODO: may consider bringing back a major overflow if there is one
 		return true;
 
 	 case TupleStatus::MAJOR_OVERFLOW:
-	 	CLEAR_BIT(stash_bucket->validity_, stash_bucket->position_[pos]);
+	 	CLEAR_BIT_256(stash_bucket->validity_, stash_bucket->position_[pos]);
 		stash_bucket->position_[pos] = StashBucket::invalid_pos;
 		overflow_count_--;
 		return true;
@@ -847,7 +878,7 @@ DLEFT_TEMPLATE
 auto DLEFT_TYPE::StashBucket::AppendMajorOverflow(K &&key, V &&value, uint32_t hash) -> bool {
 	uint8_t idx, pos;
 
-	if (~validity_ == 0) {  // No free slots, so insertion fails
+	if ((pos = FindFreeSlot()) == invalid_pos) {  // No free slots, so insertion fails
 		return false;
 	}
 
@@ -859,12 +890,11 @@ auto DLEFT_TYPE::StashBucket::AppendMajorOverflow(K &&key, V &&value, uint32_t h
 		return false;
 	}
 
-	pos = __builtin_ctzll(~validity_);
 	tuples_[pos].key = key;
 	tuples_[pos].value = value;
 	position_[idx] = pos;
 	fingerprints_[idx] = FINGERPRINT16(hash);
-	SET_BIT(validity_, pos);
+	SET_BIT_256(validity_, pos);
  #ifdef __COUNT_OVERFLOWS__
 	major_overflows++;
  #endif
@@ -878,7 +908,7 @@ auto DLEFT_TYPE::StashBucket::EraseMajorOverflow(const K &key, uint32_t hash) ->
 	if (idx == invalid_pos) {
 		return false;
 	}
-	CLEAR_BIT(validity_, position_[idx]);
+	CLEAR_BIT_256(validity_, position_[idx]);
 	position_[idx] = invalid_pos;
 	return true;
 }
@@ -922,13 +952,13 @@ DLEFT_TEMPLATE
 auto DLEFT_TYPE::StashBucket::InsertMinorOverflow(K &&key, V &&value) -> uint8_t {
 	uint8_t pos;
 
-	if (~validity_ == 0) {
+	// Find an empty slot and insert
+	if ((pos = FindFreeSlot()) == invalid_pos) {
 		return invalid_pos;
-	}  // Find an empty slot and insert
-	pos = __builtin_ctzll(~validity_);
+	}
 	tuples_[pos].key = key;
 	tuples_[pos].value = value;
-	SET_BIT(validity_, pos);
+	SET_BIT_256(validity_, pos);
  #ifdef __COUNT_OVERFLOWS__
 	minor_overflows++;
  #endif
@@ -938,9 +968,9 @@ auto DLEFT_TYPE::StashBucket::InsertMinorOverflow(K &&key, V &&value) -> uint8_t
 
 DLEFT_TEMPLATE
 auto DLEFT_TYPE::StashBucket::EraseMinorOverflow(const K &key, uint8_t pos) -> bool {
-	assert(GET_BIT(validity_, pos));
+	assert(GET_BIT_256(validity_, pos));
 	if (LIKELY( tuples_[pos].key == key )) {
-		CLEAR_BIT(validity_, pos);
+		CLEAR_BIT_256(validity_, pos);
 		return true;
 	}
 	return false;
@@ -948,7 +978,7 @@ auto DLEFT_TYPE::StashBucket::EraseMinorOverflow(const K &key, uint8_t pos) -> b
 
 DLEFT_TEMPLATE
 auto DLEFT_TYPE::StashBucket::FindMinorOverflow(const K &key, V *value, uint8_t pos) const -> bool {
-	assert(GET_BIT(validity_, pos));
+	assert(GET_BIT_256(validity_, pos));
 	if (LIKELY( tuples_[pos].key == key )) {
 		if (value != nullptr) {
 			*value = tuples_[pos].value;
