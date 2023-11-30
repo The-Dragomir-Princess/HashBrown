@@ -7,7 +7,7 @@
 #include "hashbrown.h"
 #include "xxhash.c"
 using namespace std;
-using namespace std::chrono;
+//using namespace std::chrono;
 
 void simple_test_run()
 {
@@ -31,6 +31,7 @@ void simple_test_run()
 
 void test_ips(string path)
 {
+    cout << "Results for " << path << endl;
     ifstream inputFile(path);
     if (!inputFile.is_open()) {
         cerr << "Could not open the file." << endl;
@@ -50,13 +51,13 @@ void test_ips(string path)
 
     // Let's hash
     uint64_t seed = 18446744073709551557;
-    auto start = high_resolution_clock::now();
+    auto start = chrono::high_resolution_clock::now();
     for (auto num_ptr : integers) {
         uint64_t hashed_num = hashbrown(seed, 32, num_ptr);
         //uint64_t hashed_num = XXH64(num_ptr, 32, seed);
         table[hashed_num % table_size].push_back(hashed_num);
     }
-    cout << "Computing hashes took " << duration_cast<milliseconds>(high_resolution_clock::now() - start).count() << " ms" << endl;
+    cout << "Computing hashes took " << chrono::duration_cast<chrono::milliseconds>(chrono::high_resolution_clock::now() - start).count() << " ms" << endl;
 
     // Let's find some statistics
     // Note: we round up b/c to allow for remainder items
@@ -71,10 +72,39 @@ void test_ips(string path)
     cout << "Number of buckets: " << table_size << endl;
     cout << "Number of items inserted: " << integers.size() << endl;
     cout << "Buckets overflowed: " << total_bkts_overflowed << endl;
+    cout << endl;
+}
+
+void test_hash_time(string path) {
+    cout << "Hash Time Results for " << path << endl;
+    ifstream inputFile(path);
+    if (!inputFile.is_open()) {
+        cerr << "Could not open the file." << endl;
+        return;
+    }
+    vector<uint32_t*> integers; // Vector to store the 32-bit integers
+    string line;
+    while (getline(inputFile, line)) {
+        uint32_t num = (uint32_t) stol(line);
+        integers.push_back(&num);
+    }
+    inputFile.close(); // Close the file after reading
+
+    // Let's hash
+    uint64_t seed = 18446744073709551557;
+    auto start = chrono::high_resolution_clock::now();
+    for (auto num_ptr : integers) {
+        hashbrown(seed, 32, num_ptr);
+        //XXH64(num_ptr, 32, seed);
+        //wyhash(num_ptr, 32);
+    }
+    auto dur = chrono::duration_cast<chrono::milliseconds>(chrono::high_resolution_clock::now() - start).count();
+    cout << "Computing hashes took " << dur << " ms" << endl;
+    cout << "Average " << (float) dur / (float) integers.size() << " ms per hash" << endl;
 }
 
 int main()
 {
-    test_ips("data/random_macs.txt");
+    test_hash_time("data/random_ips.txt");
     return 0;
 }
