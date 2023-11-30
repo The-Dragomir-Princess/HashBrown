@@ -717,7 +717,6 @@ add_library(
   ${UMASH_SRC}
   ${KHASHV_SRC}
   xmsx.c
-  aphash.cpp
   hashbrown.cpp
   )
 

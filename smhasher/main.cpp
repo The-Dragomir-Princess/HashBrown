@@ -759,7 +759,7 @@ HashInfo g_hashes[] =
 #endif
 { komihash_test,        64, 0x8157FF6D, "komihash",    "komihash 5.7", GOOD, {} },
 { polymur_test,         64, 0x4F894810, "polymur",     "github.com/orlp/polymur-hash v1", GOOD, {} },
-{ aphash_test, 32, 0x1, "aphash", "APartow hash from partow.net", POOR, {} },
+{ aphash_test, 32, 0x0, "aphash", "APartow hash from partow.net", POOR, {0x0} },
 { hashbrown_test, 64, 0x0, "hashbrown", "HashBrown hash func", GOOD, {0x47ebda34} },
 };
 

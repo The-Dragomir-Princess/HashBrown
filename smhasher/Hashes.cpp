@@ -1317,3 +1317,19 @@ void polymur_test ( const void *key, int len, uint32_t seed, void *out) {
   *(uint64_t*)out = polymur_hash((const uint8_t*)key, (size_t)len, &g_polymurhashparams,
                                  (uint64_t)seed);
 }
+
+//---- AP Hash
+uint32_t APHash(const void *key, int len, uint32_t seed)
+{
+   const char *str = (const char*) key;
+
+   uint32_t hash = 0xAAAAAAAA ^ seed;
+
+   for(std::size_t i = 0; i < len; i++)
+   {
+      hash ^= ((i & 1) == 0) ? (  (hash <<  7) ^ str[i] * (hash >> 3)) :
+                               (~((hash << 11) + (str[i] ^ (hash >> 5))));
+   }
+
+   return hash;
+}

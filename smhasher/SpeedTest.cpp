@@ -8,6 +8,7 @@
 #include <math.h>    // for sqrt
 #include <algorithm> // for sort, min
 #include <string>
+#include <fstream>
 
 #include <unordered_map>
 #include <parallel_hashmap/phmap.h>
@@ -161,12 +162,13 @@ void FilterOutliers2 ( std::vector<double> & v )
 //-----------------------------------------------------------------------------
 // Do I need to return a pointer here?
 vector<uint64_t*> import_data(string path) {
+    vector<uint64_t*> integers; // Vector to store the integers
     ifstream inputFile(path);
     if (!inputFile.is_open()) {
         cerr << "Could not open the file." << endl;
-        return;
+        return integers;
     }
-    vector<uint64_t*> integers; // Vector to store the integers
+
     string line;
     while (getline(inputFile, line)) {
         uint64_t num = (uint64_t) stol(line);
@@ -177,12 +179,13 @@ vector<uint64_t*> import_data(string path) {
 }
 
 vector<string> import_data_str(string path) {
+    vector<string> words; // Vector to store the lines
     ifstream inputFile(path);
     if (!inputFile.is_open()) {
         cerr << "Could not open the file." << endl;
-        return;
+        return words;
     }
-    vector<string> words; // Vector to store the lines
+
     string line;
     while (getline(inputFile, line)) {
         words.push_back(line);
@@ -368,7 +371,7 @@ void BulkSpeedTestCustom ( pfHash hash, uint32_t seed, string input_filepath )
   const int trials = 1;
   auto blocksize = sizeof(blocks[0]);
 
-  printf("Bulk speed test w/ Custom data - %d-byte keys\n",blocksize);
+  printf("Bulk speed test w/ Custom data - %ld-byte keys\n",blocksize);
   double sumbpc = 0.0;
 
   volatile double warmup_cycles = SpeedTestCustom(hash,seed,trials,blocks);

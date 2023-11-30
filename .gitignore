@@ -1,2 +1,7 @@
 .vscode/
 myprog
+smhasher/CMakeCache.txt
+smhasher/CMakeFiles/
+smhasher/CTestTestfile.cmake
+smhasher/Makefile
+smhasher/cmake_install.cmake

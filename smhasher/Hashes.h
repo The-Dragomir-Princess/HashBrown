@@ -471,8 +471,9 @@ inline void hashbrown_test (const void *key, int len, uint32_t seed, void *out) 
 }
 
 //--- APHash (APartow Hash)
+uint32_t APHash(const void *key, int len, uint32_t seed);
 inline void aphash_test (const void *key, int len, uint32_t seed, void *out) {
-  *(uint64_t*)out = (uint64_t) APHash((const char*)key);
+  *(uint32_t*)out = (uint32_t) APHash(key, len, seed);
 }
 
 
