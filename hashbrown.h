@@ -16,6 +16,8 @@ typedef unsigned char hb_uint8_t;
 
 #if defined (HB_IS_PURE) && defined (__GNUC__)
 #   define HB_PURE static __attribute__((pure)) 
+#else
+#   define HB_PURE static
 #endif
 
 // Whether or not to const the functions
@@ -23,6 +25,8 @@ typedef unsigned char hb_uint8_t;
 
 #if defined (HB_IS_CONST) && defined (__GNUC__)
 #   define HB_CONST static __attribute__((const)) 
+#else
+#   define HB_CONST static const
 #endif
 
 #define P1 0x8ebc6af09c88c6e3

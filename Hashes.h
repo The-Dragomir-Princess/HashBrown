@@ -70,11 +70,17 @@ inline void wyhash32low (const void * key, int len, uint32_t seed, void * out) {
 // HashBrown
 #include "hashbrown.h"
 inline void hashbrown_test (const void *key, int len, uint32_t seed, void *out) {
-  *(uint64_t*)out = (uint64_t) hashbrown((unsigned long long) seed, (size_t) len, key);
+  *(uint64_t*)out = (uint64_t) hashbrown((unsigned long long) seed, (size_t) len, (void*)key);
 }
 
 //---- Lookup3
 #include "lookup3.h"
 inline void lookup3_test (const void *key, int len, uint32_t seed, void *out) {
   *(uint64_t*)out = (uint64_t) lookup3((const char*)key, (uint32_t)len, (uint32_t)seed);
+}
+
+//--- APHash (APartow Hash)
+#include "aphash.h"
+inline void aphash_test (const void *key, int len, uint32_t seed, void *out) {
+  *(uint64_t*)out = (uint64_t) APHash((const char*)key);
 }
