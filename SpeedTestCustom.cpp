@@ -1,5 +1,6 @@
 #include "SpeedTest.h"
 #include "Hashes.h"
+#include "Random.h"
 
 #include <stdio.h>   // for printf
 #include <memory.h>  // for memset
@@ -250,23 +251,64 @@ NEVER_INLINE int64_t timehash_small ( pfHash hash, const void * key, int len, in
 
 //-----------------------------------------------------------------------------
 
-double SpeedTest ( pfHash hash, uint32_t seed, const int trials, string input_filepath )
+double SpeedTest ( pfHash hash, uint32_t seed, const int trials, std::vector<uint64_t *> blocks )
 {
-  auto blocks = import_data(input_filepath);
+  std::vector<double> times;
+
+  times.reserve(trials);
+
+  for(int itrial = 0; itrial < trials; itrial++)
+  {
+    double t;
+    for(auto block : blocks) {
+      auto blocksize = sizeof(block);
+
+      if(blocksize < 100)
+      {
+        t += (double)timehash_small(hash,block,blocksize,itrial);
+      }
+      else
+      {
+        t += (double)timehash(hash,block,blocksize,itrial);
+      }
+    }
+
+    t /= blocks.size(); // we ran the hash func blocks.size() times
+    if(t > 0) times.push_back(t);
+  }
+
+  //----------
+  
+  std::sort(times.begin(),times.end());
+  
+  FilterOutliers(times);
+  
+  return CalcMean(times);
+}
+
+// Randomly generates blocksize for tests on small inputs
+double SpeedTestTiny ( pfHash hash, uint32_t seed, const int trials, const int blocksize, const int align )
+{
+  Rand r(seed);
+  uint8_t *buf = new uint8_t[blocksize + 512];
+  uint64_t t1 = reinterpret_cast<uint64_t>(buf);
+  
+  t1 = (t1 + 255) & UINT64_C(0xFFFFFFFFFFFFFF00);
+  t1 += align;
+  
+  uint8_t * block = reinterpret_cast<uint8_t*>(t1);
+
+  r.rand_p(block,blocksize);
 
   //----------
 
   std::vector<double> times;
+  times.reserve(trials);
 
-  // Replace "trials" with the size of read-in data
-  int trial_count = blocks.size(); // a trial is a single hash call on 1 element
-  //times.reserve(trials)
-  times.reserve(trial_count);
-
-  for(int itrial = 0; itrial < trial_count; itrial++)
+  for(int itrial = 0; itrial < trials; itrial++)
   {
-    auto block = blocks[itrial];
-    auto blocksize = sizeof(block);
+    r.rand_p(block,blocksize);
+
     double t;
 
     if(blocksize < 100)
@@ -287,43 +329,42 @@ double SpeedTest ( pfHash hash, uint32_t seed, const int trials, string input_fi
   
   FilterOutliers(times);
   
+  delete [] buf;
+  
   return CalcMean(times);
 }
 
 //-----------------------------------------------------------------------------
-
+// Probably don't need to use this function
 void BulkSpeedTest ( pfHash hash, uint32_t seed, string input_filepath )
 {
-  const int trials = 2999;
-  const int blocksize = 256 * 1024;
+  auto blocks = import_data(input_filepath);
+
+  const int trials = 1;
+  auto blocksize = sizeof(blocks[0]);
 
   printf("Bulk speed test - %d-byte keys\n",blocksize);
   double sumbpc = 0.0;
 
-  volatile double warmup_cycles = SpeedTest(hash,seed,trials,input_filepath);
+  volatile double warmup_cycles = SpeedTest(hash,seed,trials,blocks);
 
-  double cycles = SpeedTest(hash,seed,trials,input_filepath);
+  double cycles = SpeedTest(hash,seed,trials,blocks);
+  double bpc = sizeof(blocks)/cycles;  // bytes per cycle
+  double bps = (bpc * 3000000000.0 / 1048576.0);  // using 3.0 gigs as divisor
 
-  double bestbpc = double(blocksize)/cycles;
-
-  double bestbps = (bestbpc * 3000000000.0 / 1048576.0);
-  printf("Alignment %2d - %6.3f bytes/cycle - %7.2f MiB/sec @ 3 ghz\n",align,bestbpc,bestbps);
-  sumbpc += bestbpc;
-
-  sumbpc = sumbpc / 1.0;
-  printf("Average      - %6.3f bytes/cycle - %7.2f MiB/sec @ 3 ghz\n",sumbpc,(sumbpc * 3000000000.0 / 1048576.0));
+  printf("Average - %6.3f bytes/cycle - %7.2f MiB/sec @ 3 ghz\n",bpc,bps);
   fflush(NULL);
 }
 
 //-----------------------------------------------------------------------------
 
-double TinySpeedTest ( pfHash hash, int hashsize, int keysize, uint32_t seed, bool verbose, string input_filepath )
+double TinySpeedTest ( pfHash hash, int hashsize, int keysize, uint32_t seed, bool verbose )
 {
-  const int trials = 99999;
+  const int trials = 999;
 
   if(verbose) printf("Small key speed test - %4d-byte keys - ",keysize);
   
-  double cycles = SpeedTest(hash,seed,trials,input_filepath);
+  double cycles = SpeedTestTiny(hash,seed,trials,keysize,0);
   
   printf("%8.2f cycles/hash\n",cycles);
   return cycles;
