@@ -1,2 +1,0 @@
-# HashBrown
-Network Algorithmics
