@@ -30,8 +30,11 @@ static inline bool crc32c_bad_seeds(std::vector<uint32_t> &seeds)
   seeds = std::vector<uint32_t> { UINT32_C(0x111c2232) };
   return true;
 }
+static inline bool need_minlen64_align16(pfHash hash) {
+  return false;
+}
+
 //----------
-// General purpose hashes
 
 //---- SuperFastHash
 #include "superfasthash.h"
