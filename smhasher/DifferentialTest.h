@@ -328,6 +328,7 @@ vector<uint64_t*> import_data(string path) {
 
 void CollisionTestCustom( pfHash hash, string filepath, const uint32_t bucket_count ) {
     auto integers = import_data(filepath);
+    printf("Hashing %d items into %d buckets", integers.size(), bucket_count);
 
     // Hash table to store elements in. "Linked list" collision 
     vector<uint32_t> table(bucket_count, 0);
