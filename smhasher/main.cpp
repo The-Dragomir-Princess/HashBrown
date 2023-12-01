@@ -40,6 +40,7 @@ bool g_testSeed        = false;
 bool g_testPerlinNoise = false;
 bool g_testDiff        = false;
 bool g_testDiffDist    = false;
+bool g_testCollisionCustom = true;
 bool g_testMomentChi2  = false;
 bool g_testPrng        = false;
 bool g_testBIC         = false;
@@ -72,6 +73,7 @@ TestOpts g_testopts[] =
 { g_testPerlinNoise,	"PerlinNoise" },
 { g_testDiff,         "Diff" },
 { g_testDiffDist,     "DiffDist" },
+{ g_testCollisionCustom, "CollisionCustom" },
 { g_testBIC, 	        "BIC" },
 { g_testMomentChi2,   "MomentChi2" },
 { g_testPrng,         "Prng" },
@@ -1074,12 +1076,16 @@ void test ( hashfunc<hashtype> hash, HashInfo* info )
 
   if(g_testSpeedCustom || g_testAll)
   {
-    printf("[[[ Speed Tests ]]]\n\n");
+    printf("[[[ Speed Tests w/ Input File ]]]\n\n");
     fflush(NULL);
 
     Seed_init (info, info->verification);
-    // Change datapath here to use different custom inputs (or call func multiple times)
-    BulkSpeedTestCustom(info->hash,info->verification, "data/random_ips.txt");
+
+    // Change file variable here to use different custom inputs (alt, call BulkSpeedTestCustom() multiple times)
+    string file = "data/random_ips.txt";
+    printf("Using file %s", file);
+
+    BulkSpeedTestCustom(info->hash,info->verification, file);
     printf("\n");
     fflush(NULL);
   }
@@ -1768,6 +1774,24 @@ void test ( hashfunc<hashtype> hash, HashInfo* info )
     result &= DiffDistTest2<uint64_t,hashtype>(hash, g_drawDiagram);
 
     if(!result) printf("*********FAIL*********\n");
+    printf("\n");
+    fflush(NULL);
+  }
+
+  //-----------------------------------------------------------------------------
+  // Runs collision tests using the input file as keys
+  // Bucket size is passed in as a parameter
+  // E.g. If hashing 2000 items into 500 buckets, we expect each to have 4 collisions.
+  //      More than that is considered an overflow. 
+  if (g_testCollisionCustom || g_testAll)
+  {
+    printf("[[[ Collision Tests w/ input file ]]]\n\n");
+    fflush(NULL);
+
+    string file = "data/random_ips.txt";
+    printf("Using file %s", file);
+
+    CollisionTestCustom(info->hash);
     printf("\n");
     fflush(NULL);
   }

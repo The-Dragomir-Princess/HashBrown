@@ -12,6 +12,7 @@
 #include <vector>
 #include <algorithm>
 #include <stdio.h>
+#include <fstream>
 
 //-----------------------------------------------------------------------------
 // Sort through the differentials, ignoring collisions that only occured once 
@@ -307,3 +308,51 @@ bool DiffDistTest2 ( pfHash hash, bool drawDiagram )
 }
 
 //----------------------------------------------------------------------------
+
+vector<uint64_t*> import_data(string path) {
+    vector<uint64_t*> integers; // Vector to store the integers
+    ifstream inputFile(path);
+    if (!inputFile.is_open()) {
+        cerr << "Could not open the file." << endl;
+        return integers;
+    }
+
+    string line;
+    while (getline(inputFile, line)) {
+        uint64_t num = (uint64_t) stol(line);
+        integers.push_back(&num);
+    }
+    inputFile.close(); // Close the file after reading
+    return integers;
+}
+
+void CollisionTestCustom( pfHash hash, string filepath, const uint32_t bucket_count ) {
+    auto integers = import_data(filepath);
+
+    // Hash table to store elements in. "Linked list" collision 
+    vector<uint32_t> table(bucket_count, 0);
+    int element_size = sizeof(integers[0]);
+
+    // Let's hash
+    uint32_t seed = 998244353;
+    uint64_t *out = 0;
+    for (auto num_ptr : integers) {
+        hash(num_ptr, element_size, seed, out);
+        table[*out % bucket_count]++;
+    }
+
+    // Let's find some collisions
+    // Note: we round up to allow for remainder items
+    int expected_bkts_overflowed = integers.size() % bucket_count;
+    //int expected_per_bkt = (integers.size() + bucket_count - 1) / bucket_count;
+    int expected_per_bkt = integers.size() / bucket_count;
+    int total_bkts_overflowed = 0;
+    for (auto counter : table) {
+        if (counter > expected_per_bkt) {
+            total_bkts_overflowed++;
+        }
+    }
+
+    printf("Expected %d buckets will overflow", expected_bkts_overflowed);
+    printf("%d buckets actually overflowed", total_bkts_overflowed);
+}
