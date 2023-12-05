@@ -18,6 +18,8 @@
 # include <chrono>
 # include <type_traits>
 
+// #define __TEST_PERFORMANCE__
+
 template<class K, class V, class Hasher>
 class std_unordered_map_wrapper {
  public:
@@ -45,20 +47,7 @@ class std_unordered_map_wrapper {
 
 class HashTableTest {
  private:
-  static constexpr uint32_t seed1 = 0x5d445e6e;
-  static constexpr uint32_t seed2 = 0xf09ad611;
   static constexpr uint64_t seed64 = 0x42ae2f8ce193f9da;
-
-  template<class K, uint64_t seed>
-  class Hasher {
-  public:
-    auto operator()(const K &key) const -> uint32_t {
-      return XXH32(&key, sizeof(K), seed);
-    }
-  };
-
-  using Hasher1 = Hasher<uint32_t, seed1>;
-  using Hasher2 = Hasher<uint32_t, seed2>;
 
   template<class K, uint64_t seed>
   class HasherULL {
@@ -72,7 +61,7 @@ class HashTableTest {
   // TODO: add more hash maps here
   using std_unordered_map = std_unordered_map_wrapper<uint32_t, uint32_t, Hasher64>;
   using cuckoo_map = libcuckoo::cuckoohash_map<uint32_t, uint32_t, Hasher64>;
-  using dleft_map = DleftFpStash<uint32_t, uint32_t, Hasher1, Hasher2>;
+  using dleft_map = DleftFpStash<uint32_t, uint32_t, Hasher64>;
 
   static constexpr char std_unordered_map_name[] = "std_unordered_map";
   static constexpr char cuckoo_map_name[] = "cuckoohash_map";
@@ -188,5 +177,7 @@ int main() {
  #ifdef __TEST_DLEFT__
   DleftTest::RunAllTests();
  #endif
+ #ifdef __TEST_PERFORMANCE__
   HashTableTest::RunAllTests();
+ #endif
 }

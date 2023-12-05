@@ -67,13 +67,14 @@
 #include <immintrin.h>
 
 #include <iostream>
+#include <limits>
 
 #include <cassert>
 #include <cstring>
 
 #define __TEST_DLEFT__
 #define __HASH_TABLE_TEST__
-// #define __DEBUG_DLEFT__
+#define __DEBUG_DLEFT__
 
 #ifdef __DEBUG_DLEFT__
 # define DEBUG_DLEFT(foo) foo
@@ -111,9 +112,10 @@ static uint64_t major_overflows{0};
 #define SET_BIT_256(bits, n)   (bits[n/64] |= (1ull << (n%64)))
 #define CLEAR_BIT_256(bits, n) (bits[n/64] &= ~(1ull << (n%64)))
 
-#define FINGERPRINT8(hash)  (static_cast<uint8_t>(hash))
-#define FINGERPRINT16(hash) (static_cast<uint16_t>(hash))
-#define BUCKET_IDX(hash)  ((hash) >> 16)
+#define FP(hash)   (static_cast<uint8_t>(hash))
+#define OFP(hash)  (static_cast<uint16_t>(hash))
+#define IDX1(hash) (static_cast<uint32_t>(hash))
+#define IDX2(hash) (static_cast<uint32_t>(hash >> 32))
 
 #define LIKELY(foo)   foo
 #define UNLIKELY(foo) foo
@@ -137,32 +139,55 @@ static uint64_t major_overflows{0};
 static void *buckets;
 static void *stash_buckets;
 
-template <class K, class V, class H1, class H2>
+template <class K, class V, class H>
 class DleftFpStash {
  public:
-  DleftFpStash(size_t = 0);
+	using hash_t = uint64_t;
+	using idx_t  = uint32_t;
+	using pos_t  = uint8_t;
+	using fp_t   = uint8_t;
+	using ofp_t  = uint16_t;
+
+	DleftFpStash(size_t size = 0)
+			: num_buckets_(ROUNDUP_POWER_2(size / Bucket::bucket_capacity)),
+				num_stash_buckets_(num_buckets_ / BUCKET_STASH_BUCKET_RATIO) {
+		if (num_buckets_ > (1 << 16)) {
+			printf("error: table is too large\n");
+			exit(1);
+		}
+
+		buckets = buckets_ = new Bucket[num_buckets_];
+		assert(buckets_ != nullptr);
+
+		if (num_stash_buckets_ == 0) {
+			stash_buckets_ = nullptr;
+		} else {
+			stash_buckets = stash_buckets_ = new StashBucket[num_stash_buckets_];
+			assert(stash_buckets_ != nullptr);
+		}
+	}
 
 	~DleftFpStash() { delete[] buckets_; delete[] stash_buckets_; }
 
 	auto insert(K &&key, V &&value) -> bool {
-		uint32_t hash1 = H1()(key), hash2 = H2()(key);
-		InsertStatus status = Insert<false>(std::forward<K>(key), std::forward<V>(value), hash1, hash2);
+		hash_t hash = H()(key);
+		InsertStatus status = Insert<false>(std::forward<K>(key), std::forward<V>(value), hash);
 		while (status == InsertStatus::FAILED) {
 			Resize(capacity() * 2);
-			status = Insert<false>(std::forward<K>(key), std::forward<V>(value), hash1, hash2);
+			status = Insert<false>(std::forward<K>(key), std::forward<V>(value), hash);
 		}
 		return status == InsertStatus::INSERTED;
 	}
 
-	auto erase(const K &key) -> bool { return Erase(key, H1()(key), H2()(key)); }
+	auto erase(const K &key) -> bool { return Erase(key, H()(key)); }
 
-	auto find(const K &key, V &value) const -> bool { return Find(key, &value, H1()(key), H2()(key)); }
+	auto find(const K &key, V &value) const -> bool { return Find(key, &value, H()(key)); }
 
 	void clear() {
-		for (size_t i = 0; i < num_buckets_; i++) {
+		for (idx_t i = 0; i < num_buckets_; i++) {
 			buckets_[i].Clear();
 		}
-		for (size_t i = 0; i < num_stash_buckets_; i++) {
+		for (idx_t i = 0; i < num_stash_buckets_; i++) {
 			stash_buckets_[i].Clear();
 		}
 	}
@@ -194,13 +219,13 @@ class DleftFpStash {
     // static constexpr int buf_capacity = buf_size / tuple_size;
 
     // header (32 bytes)
-    uint8_t fingerprints_[bucket_capacity];      // fingerprints for each in-bucket key
-    uint16_t validity_{0};                       // validity bitmap for each in-bucket key
-		uint8_t overflow_count_{0};                  // the total number of overflows
-		uint8_t overflow_info_{0};                   // the 2 highest bits specify the stash bucket;
-		                                             // the 4 lowest bits serve as the validity bits for minor overflows
-		uint16_t overflow_fp_[max_minor_overflows];  // fingerprints for minor overflows
-		uint8_t overflow_pos_[max_minor_overflows];  // positions of minor overflows in the stash bucket
+    fp_t fingerprints_[bucket_capacity];       // fingerprints for each in-bucket key
+    uint16_t validity_{0};                     // validity bitmap for each in-bucket key
+		pos_t overflow_count_{0};                  // the total number of overflows
+		uint8_t overflow_info_{0};                 // the 2 highest bits specify the stash bucket;
+		                                           // the 4 lowest bits serve as the validity bits for minor overflows
+		ofp_t overflow_fp_[max_minor_overflows];   // fingerprints for minor overflows
+		pos_t overflow_pos_[max_minor_overflows];  // positions of minor overflows in the stash bucket
 
 		// TODO: write buffer optimization
     // // write buffer (in the same cacheline as header)
@@ -218,24 +243,195 @@ class DleftFpStash {
 		Bucket() = default;
 
 		// Inserts a key, overwriting duplicates
-		auto Insert(K &&, V &&, uint32_t, StashBucket *) -> bool;
+		auto Insert(K &&key, V &&value, ofp_t fp, StashBucket *stash_bucket) -> bool {
+			TupleStatus status;
+			int mask;
+			pos_t idx, pos;
+
+			pos = FindPos(key, fp, stash_bucket, status);
+			switch (status) {  // If found a duplicate, overwrite it
+			 case TupleStatus::IN_BUCKET:
+				tuples_[pos].value = value;
+				return true;
+
+			 case TupleStatus::MINOR_OVERFLOW:
+				stash_bucket->tuples_[overflow_pos_[pos]].value = value;
+				return true;
+
+			 UNLIKELY( case TupleStatus::MAJOR_OVERFLOW: )
+				stash_bucket->tuples_[stash_bucket->position_[pos]].value = value;
+				return true;
+
+			 default:  // Otherwise find an empty slot and insert
+				assert(status == TupleStatus::NOT_FOUND);
+				return Append(std::forward<K>(key), std::forward<V>(value), fp, stash_bucket);
+			}
+		}
 
 		// Inserts a key without duplicate checks
-		auto Append(K &&, V &&, uint32_t, StashBucket *) -> bool;
+		auto Append(K &&key, V &&value, ofp_t fp, StashBucket *stash_bucket) -> bool {
+			int mask;
+			pos_t idx, pos;
+
+			pos = __builtin_ctz(~validity_);
+			if (pos < bucket_capacity) {  // If bucket has a free slot, insert there
+				InsertAt(std::forward<K>(key), std::forward<V>(value), pos, FP(fp));
+				return true;
+			}  // Otherwise insert into the stash bucket
+
+			if (stash_bucket == nullptr) {
+				return false;
+			}
+
+			if (LIKELY( GetMinorOverflowCount() < max_minor_overflows )) {  // Insert as a minor overflow
+				pos = stash_bucket->InsertMinorOverflow(std::forward<K>(key), std::forward<V>(value));
+				if (pos == StashBucket::invalid_pos) {
+					return false;
+				}
+
+				// Insert minor overflow metadata
+				idx = __builtin_ctz(~GetMinorOverflowValidity());
+				overflow_count_++;
+				overflow_fp_[idx] = fp;
+				overflow_pos_[idx] = pos;
+				SET_BIT(overflow_info_, idx);
+				DEBUG_DLEFT(
+					printf("Minor overflow from bucket %ld to stash bucket %ld\n",
+								 this - reinterpret_cast<Bucket *>(buckets),
+								 stash_bucket - reinterpret_cast<StashBucket *>(stash_buckets));
+				)
+
+				return true;
+			}
+
+			// Minor overflow slots used up; Insert as a major overflow
+			if (stash_bucket->AppendMajorOverflow(std::forward<K>(key), std::forward<V>(value), fp)) {
+				overflow_count_++;
+				DEBUG_DLEFT(
+					printf("Major overflow from bucket %ld to stash bucket %ld\n",
+								 this - reinterpret_cast<Bucket *>(buckets),
+								 stash_bucket - reinterpret_cast<StashBucket *>(stash_buckets));
+				)
+				return true;
+			}
+			return false;
+		}
 
 		// Removes a key
-		auto Erase(const K &, uint32_t, StashBucket *) -> bool;
+		auto Erase(const K &key, ofp_t fp, StashBucket *stash_bucket) -> bool {
+			TupleStatus status;
+			pos_t pos;
+
+			pos = FindPos(key, fp, stash_bucket, status);
+			switch (status) {  // Remove `key` depending on its position
+			 case TupleStatus::IN_BUCKET:
+				CLEAR_BIT(validity_, pos);
+				return true;
+
+			 case TupleStatus::MINOR_OVERFLOW:
+				CLEAR_BIT_256(stash_bucket->validity_, overflow_pos_[pos]);
+				CLEAR_BIT(overflow_info_, pos);
+				overflow_count_--;
+				// TODO: may consider bringing back a major overflow if there is one
+				return true;
+
+			 case TupleStatus::MAJOR_OVERFLOW:
+				CLEAR_BIT_256(stash_bucket->validity_, stash_bucket->position_[pos]);
+				stash_bucket->position_[pos] = StashBucket::invalid_pos;
+				overflow_count_--;
+				return true;
+
+			 default:
+				assert(status == TupleStatus::NOT_FOUND);
+				return false;
+			}
+		}
 
 		// Looks for a key and returns the associated value
-		auto Find(const K &, V *, uint32_t, const StashBucket *) const -> bool;
+		auto Find(const K &key, V *value, ofp_t fp, const StashBucket *stash_bucket) const -> bool {
+			TupleStatus status;
+			pos_t pos;
 
-		void InsertAt(K &&, V &&, uint8_t, uint32_t);
+			pos = FindPos(key, fp, stash_bucket, status);
+			switch (status) {  // Store `key`'s associate value depending on its position
+			 case TupleStatus::IN_BUCKET:
+				*value = tuples_[pos].value;
+				return true;
+
+			 case TupleStatus::MINOR_OVERFLOW:
+				*value = stash_bucket->tuples_[overflow_pos_[pos]].value;
+				return true;
+
+			 case TupleStatus::MAJOR_OVERFLOW:
+				*value = stash_bucket->tuples_[stash_bucket->position_[pos]].value;
+				return true;
+
+			 default:
+				assert(status == TupleStatus::NOT_FOUND);
+				return false;
+			}
+		}
+
+		void InsertAt(K &&key, V &&value, pos_t pos, fp_t fp) {
+			tuples_[pos].key = key;
+			tuples_[pos].value = value;
+			fingerprints_[pos] = fp;
+			SET_BIT(validity_, pos);
+		}
 
 		// Searches for a key and returns its position
 		// `status` == IN_BUCKET: returns the key's position in bucket
 		// `status` == MINOR_OVERFLOW: returns the index of the key's `overflow_fp_` and `overflow_pos_`
 		// `status` == MAJOR_OVERFLOW: returns the index of the key's `fingerprints_` and `position_` in stash bucket
-		auto FindPos(const K &, uint32_t, const StashBucket *, TupleStatus &) const -> uint8_t;
+		auto FindPos(const K &key, ofp_t fp, const StashBucket *stash_bucket, TupleStatus &status) const -> pos_t {
+			int mask;
+			pos_t idx, pos;
+
+			SEARCH_8_128(FP(fp), fingerprints_, mask);  // Search normal keys, filtering out unlikely slots using fingerprints
+			mask &= validity_;
+			while (mask != 0) {
+				pos = __builtin_ctz(mask);
+				if (LIKELY( tuples_[pos].key == key )) {
+					status = TupleStatus::IN_BUCKET;
+					return pos;
+				}
+			 #ifdef __COUNT_FALSE_POSITIVES__
+				false_positive++;
+			 #endif
+				mask &= ~(1 << pos);
+			}
+
+			if (stash_bucket == nullptr) {
+				goto not_found;
+			}
+
+			SEARCH_16_128(fp, overflow_fp_, mask);  // Search minor overflows, again using fingerprints
+			while (mask != 0) {
+				idx = __builtin_ctz(mask) / 2;
+				if (GET_BIT(overflow_info_, idx)) {
+					if (LIKELY( stash_bucket->tuples_[overflow_pos_[idx]].key == key )) {
+						status = TupleStatus::MINOR_OVERFLOW;
+						return idx;
+					}
+				 #ifdef __COUNT_FALSE_POSITIVES__
+					false_positive++;
+				 #endif
+				}
+				mask &= ~(3 << (idx * 2));
+			}
+
+			if (UNLIKELY( overflow_count_ > GetMinorOverflowCount() )) {  // Search major overflows in stash bucket
+				idx = stash_bucket->FindMajorOverflowIdx(key, fp);
+				if (idx != StashBucket::invalid_pos) {
+					status = TupleStatus::MAJOR_OVERFLOW;
+					return idx;
+				}
+			}
+
+		 not_found:
+			status = TupleStatus::NOT_FOUND;
+			return StashBucket::invalid_pos;
+		}
 
 		void Clear() {
 			validity_ = 0; overflow_count_ = 0; overflow_info_ = 0;
@@ -243,10 +439,10 @@ class DleftFpStash {
 		}
 
 		// Get the number of valid keys in bucket (not including overflows)
-		auto GetSize() const -> uint8_t { return __builtin_popcount(validity_); }
+		auto GetSize() const -> pos_t { return __builtin_popcount(validity_); }
 
 		// Get the total number of valid keys & overflow keys in bucket
-		auto GetTotal() const -> uint8_t { return GetSize() + overflow_count_; }
+		auto GetTotal() const -> pos_t { return GetSize() + overflow_count_; }
 
 		// Get its stash bucket's number (each bucket has at most four candidate stash buckets)
 		auto GetStashBucketNum() const -> uint8_t { return overflow_info_ >> 6; }
@@ -254,7 +450,7 @@ class DleftFpStash {
 		// Bind the bucket to a stash bucket; once bound, it cannot be unbounded unless the number of overflows becomes 0
 		void SetStashBucketNum(uint8_t num) { overflow_info_ = (num << 6) | GetMinorOverflowValidity(); }
 
-		auto GetStashBucketIndex(size_t idx, size_t max) const -> size_t {
+		auto GetStashBucketIndex(idx_t idx, idx_t max) const -> size_t {
 			return (idx / BUCKET_STASH_BUCKET_RATIO + GetStashBucketNum() * GetStride(idx)) & (max - 1);
 		}
 
@@ -272,8 +468,8 @@ class DleftFpStash {
 		static constexpr uint8_t invalid_pos = 0xff;
 
     // header (40 B)
-    uint16_t fingerprints_[max_major_overflows];            // fingerprints for major overflows
-		uint8_t  position_[max_major_overflows];                // positions of each major overflow in stash bucket
+    ofp_t fingerprints_[max_major_overflows];               // fingerprints for major overflows
+		pos_t  position_[max_major_overflows];                  // positions of each major overflow in stash bucket
     uint64_t validity_[ROUND_UP(bucket_capacity, 64)] {0};  // validity bitmap for each overflow key in stash bucket
 
 		// key-value pairs
@@ -282,35 +478,138 @@ class DleftFpStash {
 		StashBucket() { memset(position_, invalid_pos, sizeof(position_)); }
 
 		// Inserts a major overflow, overwriting duplicates
-    auto InsertMajorOverflow(K &&, V &&, uint32_t) -> bool;
+    auto InsertMajorOverflow(K &&key, V &&value, ofp_t fp) -> bool {
+			pos_t idx, pos;
+
+			idx = FindMajorOverflowIdx(key, fp);
+			if (idx != invalid_pos) {  // Overwrite duplicate if found
+				tuples_[position_[idx]].value = value;
+				return true;
+			}
+
+			return AppendMajorOverflow(std::forward<K>(key), std::forward<V>(value), fp);  // Insert at an empty slot
+		}
 
 		// Inserts a major overflow without checking duplicates
-		auto AppendMajorOverflow(K &&, V &&, uint32_t) -> bool;
+		auto AppendMajorOverflow(K &&key, V &&value, ofp_t fp) -> bool {
+			pos_t idx, pos;
+
+			if ((pos = FindFreeSlot()) == invalid_pos) {  // No free slots, so insertion fails
+				return false;
+			}
+
+			if (position_[0] == invalid_pos) {
+				idx = 0;
+			} else if (position_[1] == invalid_pos) {
+				idx = 1;
+			} else {  // Major overflow metadata used up, so insertion fails
+				return false;
+			}
+
+			tuples_[pos].key = key;
+			tuples_[pos].value = value;
+			position_[idx] = pos;
+			fingerprints_[idx] = OFP(fp);
+			SET_BIT_256(validity_, pos);
+		 #ifdef __COUNT_OVERFLOWS__
+			major_overflows++;
+		 #endif
+
+			return true;
+		}
 
 		// Removes a major overflow key
-    auto EraseMajorOverflow(const K &, uint32_t) -> bool;
+    auto EraseMajorOverflow(const K &key, ofp_t fp) -> bool {
+			pos_t idx = FindMajorOverflowIdx(key, fp);
+			if (idx == invalid_pos) {
+				return false;
+			}
+			CLEAR_BIT_256(validity_, position_[idx]);
+			position_[idx] = invalid_pos;
+			return true;
+		}
 
 		// Searches for a major overflow key and returns its associated value
-    auto FindMajorOverflow(const K &, V *, uint32_t) const -> bool;
+    auto FindMajorOverflow(const K &key, V *value, ofp_t fp) const -> bool {
+			pos_t idx = FindMajorOverflowIdx(key, fp);
+			if (idx == invalid_pos) {
+				return false;
+			}
+			if (value != nullptr) {
+				*value = tuples_[position_[idx]].value;
+			}
+			return true;
+		}
 
 		// Searches for a major overflow key and returns its index of `fingerprints_` and `position_`
-		auto FindMajorOverflowIdx(const K &, uint32_t) const -> uint8_t;
+		auto FindMajorOverflowIdx(const K &key, ofp_t fp) const -> pos_t {
+			pos_t idx;
 
-    auto InsertMinorOverflow(K &&, V &&) -> uint8_t;
+			if (position_[0] != invalid_pos && fingerprints_[0] == fp) {
+				if (LIKELY( tuples_[position_[0]].key == key )) {
+					return 0;
+				}
+			 #ifdef __COUNT_FALSE_POSITIVES__
+				false_positive++;
+			 #endif
+			}
+			if (position_[1] != invalid_pos && fingerprints_[1] == fp) {
+				if (LIKELY( tuples_[position_[1]].key == key )) {
+					return 1;
+				}
+			 #ifdef __COUNT_FALSE_POSITIVES__
+				false_positive++;
+			 #endif
+			}
+			return invalid_pos;
+		}
 
-    auto EraseMinorOverflow(const K &, uint8_t) -> bool;
+    auto InsertMinorOverflow(K &&key, V &&value) -> pos_t {
+			pos_t pos;
 
-    auto FindMinorOverflow(const K &, V *, uint8_t) const -> bool;
+			// Find an empty slot and insert
+			if ((pos = FindFreeSlot()) == invalid_pos) {
+				return invalid_pos;
+			}
+			tuples_[pos].key = key;
+			tuples_[pos].value = value;
+			SET_BIT_256(validity_, pos);
+		 #ifdef __COUNT_OVERFLOWS__
+			minor_overflows++;
+		 #endif
+
+			return pos;
+		}
+
+    auto EraseMinorOverflow(const K &key, pos_t pos) -> bool {
+			assert(GET_BIT_256(validity_, pos));
+			if (LIKELY( tuples_[pos].key == key )) {
+				CLEAR_BIT_256(validity_, pos);
+				return true;
+			}
+			return false;
+		}
+
+    auto FindMinorOverflow(const K &key, V *value, pos_t pos) const -> bool {
+			assert(GET_BIT_256(validity_, pos));
+			if (LIKELY( tuples_[pos].key == key )) {
+				if (value != nullptr) {
+					*value = tuples_[pos].value;
+				}
+				return true;
+			}
+			return false;
+		}
 
 		void Clear() { memset(validity_, 0, sizeof(validity_)); memset(position_, invalid_pos, sizeof(position_)); }
 
 		// Returns the number of valid overflow keys in bucket (either major or minor)
-		auto GetSize() const -> uint8_t {
+		auto GetSize() const -> pos_t {
 			return __builtin_popcountll(validity_[0]) + __builtin_popcountll(validity_[1])
 						 + __builtin_popcountll(validity_[2]) + __builtin_popcountll(validity_[3]);
 		};
 
-		auto FindFreeSlot() const -> uint8_t {
+		auto FindFreeSlot() const -> pos_t {
 		 	if (~validity_[0] != 0) {
 				return __builtin_ctzll(~validity_[0]);
 			} else if (~validity_[1] != 0) {
@@ -326,37 +625,278 @@ class DleftFpStash {
 
 	// Check for duplicate key in a bucket; If found, return `true` and overwrite the value if `upsert`
 	template<bool upsert = true>
-	auto CheckDuplicate(K &&, V &&, uint16_t, uint32_t) -> bool;
+	auto CheckDuplicate(K &&key, V &&value, idx_t idx, hash_t hash) -> bool {
+		using TupleStatus = typename Bucket::TupleStatus;
+		Bucket *bucket = &buckets_[idx];
+		TupleStatus status;
+		StashBucket *stash_bucket = nullptr;
+		pos_t pos;
+
+		if (stash_buckets_ != nullptr && bucket->overflow_count_ > 0) {
+			stash_bucket = &stash_buckets_[bucket->GetStashBucketIndex(idx, num_stash_buckets_)];
+		}
+
+		pos = bucket->FindPos(key, hash, stash_bucket, status);
+		if (status == TupleStatus::IN_BUCKET) {
+			if (upsert) {
+				bucket->tuples_[pos].value = value;
+			}
+			return true;
+		} else if (status == TupleStatus::MINOR_OVERFLOW) {
+			if (upsert) {
+				stash_bucket->tuples_[bucket->overflow_pos_[pos]].value = value;
+			}
+			return true;
+		} else if (UNLIKELY( status == TupleStatus::MAJOR_OVERFLOW )) {
+			if (upsert) {
+				stash_bucket->tuples_[stash_bucket->position_[pos]].value = value;
+			}
+			return true;
+		}
+		return false;
+	}
 
 	// Try to insert a kv pair into bucket, without duplicate check
-	auto TryInsert(K &&, V &&, uint16_t, uint32_t) -> bool;
+	auto TryInsert(K &&key, V &&value, idx_t idx, hash_t hash) -> bool {
+		Bucket *bucket = &buckets_[idx];
+		StashBucket *stash_bucket = nullptr;
+
+		if (bucket->overflow_count_ == 0) {  // No stash bucket yet
+			if (bucket->Append(std::forward<K>(key), std::forward<V>(value), hash, nullptr)) {
+				size_++;
+				return true;
+			}  // Bucket is full; need a stash bucket
+			if (stash_buckets_ == nullptr) {  // No usable stash bucket, so insertion fails
+				return false;
+			}
+
+			size_t stash_idx = (idx / BUCKET_STASH_BUCKET_RATIO) & (num_stash_buckets_ - 1);
+			uint8_t min_stash_num;
+			pos_t min_stash_size = 0xff;
+			for (uint8_t stash_num = 0; stash_num < 4; stash_num++) {  // Bind bucket to its most underfull candidate stash bucket
+				stash_idx = (stash_idx + GetStride(idx)) & (num_stash_buckets_ - 1);
+				pos_t size = stash_buckets_[stash_idx].GetSize();
+				if (size < min_stash_size) {
+					min_stash_num = stash_num;
+					min_stash_size = size;
+				}
+			}
+			bucket->SetStashBucketNum(min_stash_num);
+			assert(bucket->GetStashBucketNum() == min_stash_num);
+			DEBUG_DLEFT(
+				printf("Bucket %d bound with stash bucket %lu(%d)\n", idx,
+							bucket->GetStashBucketIndex(idx, num_stash_buckets_), min_stash_num);
+			)
+		}
+
+		// Retry insertion with stash bucket
+		assert(stash_buckets_ != nullptr);
+		stash_bucket = &stash_buckets_[bucket->GetStashBucketIndex(idx, num_stash_buckets_)];
+		if (bucket->Append(std::forward<K>(key), std::forward<V>(value), hash, stash_bucket)) {
+			size_++;
+			return true;
+		}
+		return false;
+	}
 
 	// Try to move one key in a bucket to its alternative bucket
 	// Returns the index of the moved key; If no key can be moved, return `invalid_pos`
-	auto OneMove(uint16_t) -> uint8_t;
+	auto OneMove(idx_t idx) -> pos_t {
+		Bucket *bucket = &buckets_[idx];
+
+		// @note Computing (potentially) two hashes for each key seems a bit expensive here;
+		//       We should consider using one additional bit for each key to indicate which hash
+		//       function to use, or simply store the other hash as fingerprint (in which case
+		//       the distance between the two buckets must be limited).
+		//       For now we just keep it that way, since we're focusing on read latency.
+		assert(bucket->GetSize() == Bucket::bucket_capacity);
+		for (int i = 0; i < Bucket::bucket_capacity; i++) {
+			hash_t hash = H()(bucket->tuples_[i].key);
+			idx_t alt_idx = IDX1(hash) & (num_buckets_ - 1);
+			uint8_t alt_fp = FP(IDX2(hash));
+			if (alt_idx == idx) {
+				alt_fp = FP(alt_idx);
+				alt_idx = IDX2(hash) & (num_buckets_ - 1);
+				if (UNLIKELY( alt_idx == idx )) {
+					continue;
+				}
+			}
+			Bucket *alt_bucket = &buckets_[alt_idx];
+			if (alt_bucket->GetSize() == Bucket::bucket_capacity) {
+				continue;
+			}  // `alt_bucket` has free space, so move the key there
+			alt_bucket->Append(std::move(bucket->tuples_[i].key), std::move(bucket->tuples_[i].value), hash, nullptr);
+			return static_cast<uint8_t>(i);
+		}
+		return StashBucket::invalid_pos;
+	}
 
 	// Inserts a key into the hash table; If a duplicate is found, the value is overwritten
 	// Returns `INSERTED` if insertion was successful, `EXISTED` if a duplicate key is found,
 	// and `FAILED` if the insertion failed (e.g. when running out of space)
 	// template argument `upsert` defines whether to overwrite duplicates
 	template<bool upsert = true>
-  auto Insert(K &&, V &&, uint32_t, uint32_t) -> InsertStatus;
+  auto Insert(K &&key, V &&value, hash_t hash) -> InsertStatus {
+		idx_t idx1 = IDX1(hash) & (num_buckets_ - 1);
+		idx_t idx2 = IDX2(hash) & (num_buckets_ - 1);
+
+		// Check for duplicates
+		if (CheckDuplicate<upsert>(std::forward<K>(key), std::forward<V>(value), idx1, OFP(idx2)) ||
+				CheckDuplicate<upsert>(std::forward<K>(key), std::forward<V>(value), idx2, OFP(idx1))) {
+			return InsertStatus::EXISTED;
+		}  // If not found, insert
+		return Append(std::forward<K>(key), std::forward<V>(value), hash) ?
+					 InsertStatus::INSERTED : InsertStatus::FAILED;
+	}
 
 	// Inserts a key into the hash table without duplicate checks
 	// Returns `true` if insertion is successful and `false` otherwise (e.g. when running out of space)
-	auto Append(K &&, V &&, uint32_t, uint32_t) -> bool;
+	auto Append(K &&key, V &&value, hash_t hash) -> bool {
+		idx_t idx1 = IDX1(hash) & (num_buckets_ - 1);
+		idx_t idx2 = IDX2(hash) & (num_buckets_ - 1);
+
+		// Try inserting into the more underfull candidate bucket first
+		if (buckets_[idx1].GetTotal() <= buckets_[idx2].GetTotal()) {
+			if (TryInsert(std::forward<K>(key), std::forward<V>(value), idx1, OFP(idx2)) ||
+					TryInsert(std::forward<K>(key), std::forward<V>(value), idx2, OFP(idx1))) {
+				return true;
+			}
+		} else {
+			if (TryInsert(std::forward<K>(key), std::forward<V>(value), idx2, OFP(idx1)) ||
+					TryInsert(std::forward<K>(key), std::forward<V>(value), idx1, OFP(idx2))) {
+				return true;
+			}
+		}
+
+		// Insertion failed; do one move on both buckets
+		pos_t pos;
+		if ((pos = OneMove(idx1)) != StashBucket::invalid_pos) {
+			buckets_[idx1].InsertAt(std::forward<K>(key), std::forward<V>(key), pos, OFP(idx2));
+		} else if ((pos = OneMove(idx2)) != StashBucket::invalid_pos) {
+			buckets_[idx2].InsertAt(std::forward<K>(key), std::forward<V>(key), pos, OFP(idx1));
+		}
+
+		return false;
+	}
 
 	// Removes a key from the hash table
 	// Returns `true` if found and `false` otherwise
-  auto Erase(const K &, uint32_t, uint32_t) -> bool;
+  auto Erase(const K &key, hash_t hash) -> bool {
+		idx_t idx1 = IDX1(hash) & (num_buckets_ - 1);
+		idx_t idx2 = IDX2(hash) & (num_buckets_ - 1);
+		Bucket *bucket1 = &buckets_[idx1], *bucket2 = &buckets_[idx2];
+		StashBucket *stash_bucket1{nullptr}, *stash_bucket2{nullptr};
+
+		if (bucket1->overflow_count_ > 0 && stash_buckets_ != nullptr) {
+			stash_bucket1 = &stash_buckets_[bucket1->GetStashBucketIndex(idx1, num_stash_buckets_)];
+		}
+		if (bucket1->Erase(key, OFP(idx2), stash_bucket1)) {  // Try remove from the first bucket
+			size_--;
+			return true;
+		} else if (idx1 == idx2) {
+			return false;
+		}
+
+		if (bucket2->overflow_count_ > 0 && stash_buckets_ != nullptr) {
+			stash_bucket2 = &stash_buckets_[bucket2->GetStashBucketIndex(idx2, num_stash_buckets_)];
+		}  // If not found, try remove from the second bucket
+		if (bucket2->Erase(key, OFP(idx1), stash_bucket2)) {
+			size_--;
+			return true;
+		}
+		return false;
+	}
 
 	// Searches for a key from the hash table
 	// Returns `true` if found and `false` otherwise; value is stored in the second argument
-  auto Find(const K &, V *, uint32_t, uint32_t) const -> bool;
+  auto Find(const K &key, V *value, hash_t hash) const -> bool {
+		// TODO: parallelize the probing of two buckets
+		idx_t idx1 = IDX1(hash) & (num_buckets_ - 1);
+		idx_t idx2 = IDX2(hash) & (num_buckets_ - 1);
+		Bucket *bucket1 = &buckets_[idx1], *bucket2 = &buckets_[idx2];
+		StashBucket *stash_bucket1{nullptr}, *stash_bucket2{nullptr};
+
+		if (bucket1->overflow_count_ > 0 && stash_buckets_ != nullptr) {
+			stash_bucket1 = &stash_buckets_[bucket1->GetStashBucketIndex(idx1, num_stash_buckets_)];
+		}
+		if (bucket1->Find(key, value, OFP(idx2), stash_bucket1)) {  // Search the first bucket
+			return true;
+		} else if (idx1 == idx2) {
+			return false;
+		}
+
+		if (bucket2->overflow_count_ > 0 && stash_buckets_ != nullptr) {
+			stash_bucket2 = &stash_buckets_[bucket2->GetStashBucketIndex(idx2, num_stash_buckets_)];
+		}  // If not found, search the second bucket
+		return bucket2->Find(key, value, OFP(idx1), stash_bucket2);
+	}
 
 	// Resize the table; may fail if the new size is smaller than current size
 	// Returns `true` if resize is successful and false otherwise
-  auto Resize(size_t) -> bool;
+  auto Resize(size_t new_size) -> bool {
+		idx_t old_num_buckets = num_buckets_;
+		idx_t old_num_stash_buckets = num_stash_buckets_;
+		Bucket *old_buckets = buckets_;
+		StashBucket *old_stash_buckets = stash_buckets_;
+		size_t new_capacity = ROUNDUP_POWER_2(new_size / Bucket::bucket_capacity);
+
+		if (num_buckets_ == new_capacity) {
+			return true;
+		}
+
+		if (new_capacity > std::numeric_limits<idx_t>::max()) {
+			printf("error: table is too large\n");
+			exit(1);
+		}
+		num_buckets_ = new_capacity;
+		num_stash_buckets_ = num_buckets_ / BUCKET_STASH_BUCKET_RATIO;
+		buckets_ = new Bucket[num_buckets_];
+		assert(buckets_ != nullptr);
+		stash_buckets_ = (num_stash_buckets_ > 0 ? new StashBucket[num_stash_buckets_] : nullptr);
+
+		for (size_t i = 0; i < old_num_buckets; i++) {  // Iterate over normal buckets and rehash the keys
+			for (int j = 0; j < Bucket::bucket_capacity; j++) {
+				if (!GET_BIT(old_buckets[i].validity_, j)) {
+					continue;
+				}
+				auto &key = old_buckets[i].tuples_[j].key;
+				auto &value = old_buckets[i].tuples_[j].value;
+				hash_t hash = H()(key);
+				if (!Append(std::move(key), std::move(value), hash)) {
+					goto resize_failed;
+				}
+			}
+		}
+		for (size_t i = 0; i < old_num_stash_buckets; i++) {  // Iterate over stash buckets and rehash the keys
+			for (int j = 0; j < StashBucket::bucket_capacity; j++) {
+				if (!GET_BIT_256(old_stash_buckets[i].validity_, j)) {
+					continue;
+				}
+				auto &key = old_stash_buckets[i].tuples_[j].key;
+				auto &value = old_stash_buckets[i].tuples_[j].value;
+				hash_t hash = H()(key);
+				if (!Append(std::move(key), std::move(value), hash)) {
+					goto resize_failed;
+				}
+			}
+		}
+
+		delete old_buckets;
+		delete old_stash_buckets;
+		
+		return true;
+
+	 resize_failed:  // If any insertion fails, resize fails
+		delete buckets_;
+		delete stash_buckets_;
+
+		num_buckets_ = old_num_buckets;
+		num_stash_buckets_ = old_num_stash_buckets;
+		buckets_ = old_buckets;
+		stash_buckets_ = old_stash_buckets;
+
+		return false;
+	}
 
 	auto BucketCapacity() const -> size_t { return Bucket::bucket_capacity * num_buckets_; }
 
@@ -364,9 +904,9 @@ class DleftFpStash {
 
 	static auto GetStride(uint16_t idx) -> size_t { return idx * idx + 7 * idx + 457; }
 
-	size_t num_buckets_;
+	idx_t num_buckets_;
 
-	size_t num_stash_buckets_;
+	idx_t num_stash_buckets_;
 
 	size_t size_{0};
 
@@ -381,614 +921,6 @@ class DleftFpStash {
 #endif
 };
 
-#define DLEFT_TEMPLATE template <class K, class V, class H1, class H2>
-#define DLEFT_TYPE DleftFpStash<K, V, H1, H2>
-
-DLEFT_TEMPLATE
-DLEFT_TYPE::DleftFpStash(size_t size)
-		: num_buckets_(ROUNDUP_POWER_2(size / Bucket::bucket_capacity)),
-			num_stash_buckets_(num_buckets_ / BUCKET_STASH_BUCKET_RATIO) {
-	if (num_buckets_ > (1 << 16)) {
-		printf("error: table is too large\n");
-		exit(1);
-	}
-
-	buckets = buckets_ = new Bucket[num_buckets_];
-	assert(buckets_ != nullptr);
-
-	if (num_stash_buckets_ == 0) {
-		stash_buckets_ = nullptr;
-	} else {
-		stash_buckets = stash_buckets_ = new StashBucket[num_stash_buckets_];
-		assert(stash_buckets_ != nullptr);
-	}
-}
-
-DLEFT_TEMPLATE
-template<bool upsert>
-auto DLEFT_TYPE::CheckDuplicate(K &&key, V &&value, uint16_t idx, uint32_t hash) -> bool {
-	using TupleStatus = typename Bucket::TupleStatus;
-	Bucket *bucket = &buckets_[idx];
-	TupleStatus status;
-	StashBucket *stash_bucket = nullptr;
-	uint8_t pos;
-
-	if (stash_buckets_ != nullptr && bucket->overflow_count_ > 0) {
-		stash_bucket = &stash_buckets_[bucket->GetStashBucketIndex(idx, num_stash_buckets_)];
-	}
-
-	pos = bucket->FindPos(key, hash, stash_bucket, status);
-	if (status == TupleStatus::IN_BUCKET) {
-		if (upsert) {
-			bucket->tuples_[pos].value = value;
-		}
-		return true;
-	} else if (status == TupleStatus::MINOR_OVERFLOW) {
-		if (upsert) {
-			stash_bucket->tuples_[bucket->overflow_pos_[pos]].value = value;
-		}
-		return true;
-	} else if (UNLIKELY( status == TupleStatus::MAJOR_OVERFLOW )) {
-		if (upsert) {
-			stash_bucket->tuples_[stash_bucket->position_[pos]].value = value;
-		}
-		return true;
-	}
-	return false;
-}
-
-DLEFT_TEMPLATE
-auto DLEFT_TYPE::TryInsert(K &&key, V &&value, uint16_t idx, uint32_t hash) -> bool {
-	Bucket *bucket = &buckets_[idx];
-	StashBucket *stash_bucket = nullptr;
-
-	if (bucket->overflow_count_ == 0) {  // No stash bucket yet
-		if (bucket->Append(std::forward<K>(key), std::forward<V>(value), hash, nullptr)) {
-			size_++;
-			return true;
-		}  // Bucket is full; need a stash bucket
-		if (stash_buckets_ == nullptr) {  // No usable stash bucket, so insertion fails
-			return false;
-		}
-
-		uint8_t stash_idx = (idx / BUCKET_STASH_BUCKET_RATIO) & (num_stash_buckets_ - 1), min_stash_num;
-		uint8_t min_stash_size = 0xff;
-		for (uint8_t stash_num = 0; stash_num < 4; stash_num++) {  // Bind bucket to its most underfull candidate stash bucket
-			stash_idx = (stash_idx + GetStride(idx)) & (num_stash_buckets_ - 1);
-			uint8_t size = stash_buckets_[stash_idx].GetSize();
-			if (size < min_stash_size) {
-				min_stash_num = stash_num;
-				min_stash_size = size;
-			}
-		}
-		bucket->SetStashBucketNum(min_stash_num);
-		assert(bucket->GetStashBucketNum() == min_stash_num);
-		DEBUG_DLEFT(
-			printf("Bucket %d bound with stash bucket %lu(%d)\n", idx,
-						 bucket->GetStashBucketIndex(idx, num_stash_buckets_), min_stash_num);
-		)
-	}
-
-	// Retry insertion with stash bucket
-	assert(stash_buckets_ != nullptr);
-	stash_bucket = &stash_buckets_[bucket->GetStashBucketIndex(idx, num_stash_buckets_)];
-	if (bucket->Append(std::forward<K>(key), std::forward<V>(value), hash, stash_bucket)) {
-		size_++;
-		return true;
-	}
-	return false;
-}
-
-DLEFT_TEMPLATE
-auto DLEFT_TYPE::OneMove(uint16_t idx) -> uint8_t {
-	Bucket *bucket = &buckets_[idx];
-
-	// @note Computing (potentially) two hashes for each key seems a bit expensive here;
-	//       We should consider using one additional bit for each key to indicate which hash
-	//       function to use, or simply store the other hash as fingerprint (in which case
-	//       the distance between the two buckets must be limited).
-	//       For now we just keep it that way, since we're focusing on read latency.
-	assert(bucket->GetSize() == Bucket::bucket_capacity);
-	for (int i = 0; i < Bucket::bucket_capacity; i++) {
-		uint32_t hash = H1()(bucket->tuples_[i].key);
-		uint8_t alt_idx = BUCKET_IDX(hash) & (num_buckets_ - 1);
-		if (alt_idx == idx) {
-			hash = H2()(bucket->tuples_[i].key);
-			uint8_t alt_idx = BUCKET_IDX(hash) & (num_buckets_ - 1);
-			if (UNLIKELY( alt_idx == idx )) {
-				continue;
-			}
-		}
-		Bucket *alt_bucket = &buckets_[alt_idx];
-		if (alt_bucket->GetSize() == Bucket::bucket_capacity) {
-			continue;
-		}  // `alt_bucket` has free space, so move the key there
-		alt_bucket->Append(std::move(bucket->tuples_[i].key), std::move(bucket->tuples_[i].value), hash, nullptr);
-		return static_cast<uint8_t>(i);
-	}
-	return StashBucket::invalid_pos;
-}
-
-DLEFT_TEMPLATE
-template<bool upsert>
-auto DLEFT_TYPE::Insert(K &&key, V &&value, uint32_t hash1, uint32_t hash2) -> InsertStatus {
-	uint16_t idx1 = BUCKET_IDX(hash1) & (num_buckets_ - 1);
-	uint16_t idx2 = BUCKET_IDX(hash2) & (num_buckets_ - 1);
-
-	// Check for duplicates
-	if (CheckDuplicate<upsert>(std::forward<K>(key), std::forward<V>(value), idx1, hash1) ||
-			CheckDuplicate<upsert>(std::forward<K>(key), std::forward<V>(value), idx2, hash2)) {
-		return InsertStatus::EXISTED;
-	} // If not found, insert
-	return Append(std::forward<K>(key), std::forward<V>(value), hash1, hash2) ?
-				 InsertStatus::INSERTED : InsertStatus::FAILED;
-}
-
-DLEFT_TEMPLATE
-auto DLEFT_TYPE::Append(K &&key, V &&value, uint32_t hash1, uint32_t hash2) -> bool {
-	uint16_t idx1 = BUCKET_IDX(hash1) & (num_buckets_ - 1);
-	uint16_t idx2 = BUCKET_IDX(hash2) & (num_buckets_ - 1);
-
-	// Try inserting into the more underfull candidate bucket first
-	if (buckets_[idx1].GetTotal() <= buckets_[idx2].GetTotal()) {
-		if (TryInsert(std::forward<K>(key), std::forward<V>(value), idx1, hash1) ||
-				TryInsert(std::forward<K>(key), std::forward<V>(value), idx2, hash2)) {
-			return true;
-		}
-	} else {
-		if (TryInsert(std::forward<K>(key), std::forward<V>(value), idx2, hash2) ||
-				TryInsert(std::forward<K>(key), std::forward<V>(value), idx1, hash1)) {
-			return true;
-		}
-	}
-
-	// Insertion failed; do one move on both buckets
-	uint8_t pos;
-	if ((pos = OneMove(idx1)) != StashBucket::invalid_pos) {
-		buckets_[idx1].InsertAt(std::forward<K>(key), std::forward<V>(key), pos, hash1);
-	} else if ((pos = OneMove(idx2)) != StashBucket::invalid_pos) {
-		buckets_[idx2].InsertAt(std::forward<K>(key), std::forward<V>(key), pos, hash2);
-	}
-
-	return false;
-}
-
-DLEFT_TEMPLATE
-auto DLEFT_TYPE::Erase(const K &key, uint32_t hash1, uint32_t hash2) -> bool {
-	uint16_t idx1 = BUCKET_IDX(hash1) & (num_buckets_ - 1);
-	uint16_t idx2 = BUCKET_IDX(hash2) & (num_buckets_ - 1);
-	Bucket *bucket1 = &buckets_[idx1], *bucket2 = &buckets_[idx2];
-	StashBucket *stash_bucket1{nullptr}, *stash_bucket2{nullptr};
-
-	if (bucket1->overflow_count_ > 0 && stash_buckets_ != nullptr) {
-		stash_bucket1 = &stash_buckets_[bucket1->GetStashBucketIndex(idx1, num_stash_buckets_)];
-	}
-	if (bucket1->Erase(key, hash1, stash_bucket1)) {  // Try remove from the first bucket
-		size_--;
-		return true;
-	} else if (idx1 == idx2) {
-		return false;
-	}
-
-	if (bucket2->overflow_count_ > 0 && stash_buckets_ != nullptr) {
-		stash_bucket2 = &stash_buckets_[bucket2->GetStashBucketIndex(idx2, num_stash_buckets_)];
-	}  // If not found, try remove from the second bucket
-	if (bucket2->Erase(key, hash2, stash_bucket2)) {
-		size_--;
-		return true;
-	}
-	return false;
-}
-
-DLEFT_TEMPLATE
-auto DLEFT_TYPE::Find(const K &key, V *value, uint32_t hash1, uint32_t hash2) const -> bool {
-	// TODO: parallelize the probing of two buckets
-	uint16_t idx1 = BUCKET_IDX(hash1) & (num_buckets_ - 1);
-	uint16_t idx2 = BUCKET_IDX(hash2) & (num_buckets_ - 1);
-	Bucket *bucket1 = &buckets_[idx1], *bucket2 = &buckets_[idx2];
-	StashBucket *stash_bucket1{nullptr}, *stash_bucket2{nullptr};
-
-	if (bucket1->overflow_count_ > 0 && stash_buckets_ != nullptr) {
-		stash_bucket1 = &stash_buckets_[bucket1->GetStashBucketIndex(idx1, num_stash_buckets_)];
-	}
-	if (bucket1->Find(key, value, hash1, stash_bucket1)) {  // Search the first bucket
-		return true;
-	} else if (idx1 == idx2) {
-		return false;
-	}
-
-	if (bucket2->overflow_count_ > 0 && stash_buckets_ != nullptr) {
-		stash_bucket2 = &stash_buckets_[bucket2->GetStashBucketIndex(idx2, num_stash_buckets_)];
-	}  // If not found, search the second bucket
-	return bucket2->Find(key, value, hash2, stash_bucket2);
-}
-
-DLEFT_TEMPLATE
-auto DLEFT_TYPE::Resize(size_t new_size) -> bool {
-	size_t old_num_buckets = num_buckets_;
-	size_t old_num_stash_buckets = num_stash_buckets_;
-	Bucket *old_buckets = buckets_;
-	StashBucket *old_stash_buckets = stash_buckets_;
-	size_t new_capacity = ROUNDUP_POWER_2(new_size / Bucket::bucket_capacity);
-
-	if (num_buckets_ == new_capacity) {
-		return true;
-	}
-
-	if (new_capacity > (1 << 16)) {
-		printf("error: table is too large\n");
-	 #ifdef __COUNT_OVERFLOWS__
-		double bucket_lf = 1.0 * (this->size() - minor_overflows - major_overflows) / BucketCapacity();
-		double stash_lf = 1.0 * (minor_overflows + major_overflows) / StashBucketCapacity();
-		printf("Bucket Load Factor: %lf\n", bucket_lf);
-		printf("Stash Bucket Load Factor: %lf\n", stash_lf);
-	 #endif
-		exit(1);
-	}
-	num_buckets_ = new_capacity;
-	num_stash_buckets_ = num_buckets_ / BUCKET_STASH_BUCKET_RATIO;
-	buckets_ = new Bucket[num_buckets_];
-	assert(buckets_ != nullptr);
-	stash_buckets_ = (num_stash_buckets_ > 0 ? new StashBucket[num_stash_buckets_] : nullptr);
-
-	for (size_t i = 0; i < old_num_buckets; i++) {  // Iterate over normal buckets and rehash the keys
-		for (auto j = 0; j < Bucket::bucket_capacity; j++) {
-			if (!GET_BIT(old_buckets[i].validity_, j)) {
-				continue;
-			}
-			auto &key = old_buckets[i].tuples_[j].key;
-			auto &value = old_buckets[i].tuples_[j].value;
-			if (!Append(std::move(key), std::move(value), H1()(key), H2()(key))) {
-				goto resize_failed;
-			}
-		}
-	}
-	for (size_t i = 0; i < old_num_stash_buckets; i++) {  // Iterate over stash buckets and rehash the keys
-		for (auto j = 0; j < StashBucket::bucket_capacity; j++) {
-			if (!GET_BIT_256(old_stash_buckets[i].validity_, j)) {
-				continue;
-			}
-			auto &key = old_stash_buckets[i].tuples_[j].key;
-			auto &value = old_stash_buckets[i].tuples_[j].value;
-			if (!Append(std::move(key), std::move(value), H1()(key), H2()(key))) {
-				goto resize_failed;
-			}
-		}
-	}
-
-	delete old_buckets;
-	delete old_stash_buckets;
-	
-	return true;
-
- resize_failed:  // If any insertion fails, resize fails
- 	delete buckets_;
-	delete stash_buckets_;
-
-	num_buckets_ = old_num_buckets;
-	num_stash_buckets_ = old_num_stash_buckets;
-	buckets_ = old_buckets;
-	stash_buckets_ = old_stash_buckets;
-
-	return false;
-}
-
-DLEFT_TEMPLATE
-auto DLEFT_TYPE::Bucket::Insert(K &&key, V &&value, uint32_t hash, StashBucket *stash_bucket) -> bool {
-	TupleStatus status;
-	int mask;
-	uint8_t idx, pos;
-
-	pos = FindPos(key, hash, stash_bucket, status);
-	switch (status) {  // If found a duplicate, overwrite it
-	 case TupleStatus::IN_BUCKET:
-		tuples_[pos].value = value;
-		return true;
-
-	 case TupleStatus::MINOR_OVERFLOW:
-	 	stash_bucket->tuples_[overflow_pos_[pos]].value = value;
-		return true;
-
-	 UNLIKELY( case TupleStatus::MAJOR_OVERFLOW: )
-	 	stash_bucket->tuples_[stash_bucket->position_[pos]].value = value;
-		return true;
-
-	 default:  // Otherwise find an empty slot and insert
-	 	assert(status == TupleStatus::NOT_FOUND);
-	  return Append(std::forward<K>(key), std::forward<V>(value), hash, stash_bucket);
-	}
-}
-
-DLEFT_TEMPLATE
-auto DLEFT_TYPE::Bucket::Append(K &&key, V &&value, uint32_t hash, StashBucket *stash_bucket) -> bool {
-	int mask;
-	uint8_t idx, pos;
-
-	pos = __builtin_ctz(~validity_);
-	if (pos < bucket_capacity) {  // If bucket has a free slot, insert there
-		InsertAt(std::forward<K>(key), std::forward<V>(value), pos, hash);
-		return true;
-	}  // Otherwise insert into the stash bucket
-
-	if (stash_bucket == nullptr) {
-		return false;
-	}
-
-	if (LIKELY( GetMinorOverflowCount() < max_minor_overflows )) {  // Insert as a minor overflow
-		pos = stash_bucket->InsertMinorOverflow(std::forward<K>(key), std::forward<V>(value));
-		if (pos == StashBucket::invalid_pos) {
-			return false;
-		}
-
-		// Insert minor overflow metadata
-		idx = __builtin_ctz(~GetMinorOverflowValidity());
-		overflow_count_++;
-		overflow_fp_[idx] = FINGERPRINT16(hash);
-		overflow_pos_[idx] = pos;
-		SET_BIT(overflow_info_, idx);
-		DEBUG_DLEFT(
-			printf("Minor overflow from bucket %ld to stash bucket %ld\n",
-					 	 this - reinterpret_cast<Bucket *>(buckets),
-					 	 stash_bucket - reinterpret_cast<StashBucket *>(stash_buckets));
-		)
-
-		return true;
-	}
-
-	// Minor overflow slots used up; Insert as a major overflow
-	if (stash_bucket->AppendMajorOverflow(std::forward<K>(key), std::forward<V>(value), hash)) {
-		overflow_count_++;
-		DEBUG_DLEFT(
-			printf("Major overflow from bucket %ld to stash bucket %ld\n",
-					 	 this - reinterpret_cast<Bucket *>(buckets),
-					 	 stash_bucket - reinterpret_cast<StashBucket *>(stash_buckets));
-		)
-		return true;
-	}
-	return false;
-}
-
-DLEFT_TEMPLATE
-auto DLEFT_TYPE::Bucket::Erase(const K &key, uint32_t hash, StashBucket *stash_bucket) -> bool {
-	TupleStatus status;
-	uint8_t pos;
-
-	pos = FindPos(key, hash, stash_bucket, status);
-	switch (status) {  // Remove `key` depending on its position
-	 case TupleStatus::IN_BUCKET:
-		CLEAR_BIT(validity_, pos);
-		return true;
-
-	 case TupleStatus::MINOR_OVERFLOW:
-	 	CLEAR_BIT_256(stash_bucket->validity_, overflow_pos_[pos]);
-	 	CLEAR_BIT(overflow_info_, pos);
-		overflow_count_--;
-		// TODO: may consider bringing back a major overflow if there is one
-		return true;
-
-	 case TupleStatus::MAJOR_OVERFLOW:
-	 	CLEAR_BIT_256(stash_bucket->validity_, stash_bucket->position_[pos]);
-		stash_bucket->position_[pos] = StashBucket::invalid_pos;
-		overflow_count_--;
-		return true;
-
-	 default:
-	 	assert(status == TupleStatus::NOT_FOUND);
-	  return false;
-	}
-}
-
-DLEFT_TEMPLATE
-auto DLEFT_TYPE::Bucket::Find(const K &key, V *value, uint32_t hash, const StashBucket *stash_bucket) const -> bool {
-	TupleStatus status;
-	uint8_t pos;
-
-	pos = FindPos(key, hash, stash_bucket, status);
-	switch (status) {  // Store `key`'s associate value depending on its position
-	 case TupleStatus::IN_BUCKET:
-		*value = tuples_[pos].value;
-		return true;
-
-	 case TupleStatus::MINOR_OVERFLOW:
-	 	*value = stash_bucket->tuples_[overflow_pos_[pos]].value;
-		return true;
-
-	 case TupleStatus::MAJOR_OVERFLOW:
-	 	*value = stash_bucket->tuples_[stash_bucket->position_[pos]].value;
-		return true;
-
-	 default:
-	 	assert(status == TupleStatus::NOT_FOUND);
-	  return false;
-	}
-}
-
-DLEFT_TEMPLATE
-auto DLEFT_TYPE::Bucket::FindPos(const K &key, uint32_t hash, const StashBucket *stash_bucket, TupleStatus &status) const -> uint8_t {
-	int mask;
-	uint8_t idx, pos;
-
-	SEARCH_8_128(FINGERPRINT8(hash), fingerprints_, mask);  // Search normal keys, filtering out unlikely slots using fingerprints
-	mask &= validity_;
-	while (mask != 0) {
-		pos = __builtin_ctz(mask);
-		if (LIKELY( tuples_[pos].key == key )) {
-			status = TupleStatus::IN_BUCKET;
-			return pos;
-		}
-	 #ifdef __COUNT_FALSE_POSITIVES__
-		false_positive++;
-	 #endif
-		mask &= ~(1 << pos);
-	}
-
-	if (stash_bucket == nullptr) {
-		goto not_found;
-	}
-
-	SEARCH_16_128(FINGERPRINT16(hash), overflow_fp_, mask);  // Search minor overflows, again using fingerprints
-	while (mask != 0) {
-		idx = __builtin_ctz(mask) / 2;
-		if (GET_BIT(overflow_info_, idx)) {
-			if (LIKELY( stash_bucket->tuples_[overflow_pos_[idx]].key == key )) {
-				status = TupleStatus::MINOR_OVERFLOW;
-				return idx;
-			}
-		 #ifdef __COUNT_FALSE_POSITIVES__
-			false_positive++;
-		 #endif
-		}
-		mask &= ~(3 << (idx * 2));
-	}
-
-	if (UNLIKELY( overflow_count_ > GetMinorOverflowCount() )) {  // Search major overflows in stash bucket
-		idx = stash_bucket->FindMajorOverflowIdx(key, hash);
-		if (idx != StashBucket::invalid_pos) {
-			status = TupleStatus::MAJOR_OVERFLOW;
-			return idx;
-		}
-	}
-
- not_found:
-	status = TupleStatus::NOT_FOUND;
-	return StashBucket::invalid_pos;
-}
-
-DLEFT_TEMPLATE
-void DLEFT_TYPE::Bucket::InsertAt(K &&key, V &&value, uint8_t pos, uint32_t hash) {
-	tuples_[pos].key = key;
-	tuples_[pos].value = value;
-	fingerprints_[pos] = FINGERPRINT8(hash);
-	SET_BIT(validity_, pos);
-}
-
-DLEFT_TEMPLATE
-auto DLEFT_TYPE::StashBucket::InsertMajorOverflow(K &&key, V &&value, uint32_t hash) -> bool {
-	uint8_t idx, pos;
-
-	idx = FindMajorOverflowIdx(key, hash);
-	if (idx != invalid_pos) {  // Overwrite duplicate if found
-		tuples_[position_[idx]].value = value;
-		return true;
-	}
-
-	return AppendMajorOverflow(std::forward<K>(key), std::forward<V>(value), hash);  // Insert at an empty slot
-}
-
-DLEFT_TEMPLATE
-auto DLEFT_TYPE::StashBucket::AppendMajorOverflow(K &&key, V &&value, uint32_t hash) -> bool {
-	uint8_t idx, pos;
-
-	if ((pos = FindFreeSlot()) == invalid_pos) {  // No free slots, so insertion fails
-		return false;
-	}
-
-	if (position_[0] == invalid_pos) {
-		idx = 0;
-	} else if (position_[1] == invalid_pos) {
-		idx = 1;
-	} else {  // Major overflow metadata used up, so insertion fails
-		return false;
-	}
-
-	tuples_[pos].key = key;
-	tuples_[pos].value = value;
-	position_[idx] = pos;
-	fingerprints_[idx] = FINGERPRINT16(hash);
-	SET_BIT_256(validity_, pos);
- #ifdef __COUNT_OVERFLOWS__
-	major_overflows++;
- #endif
-
-	return true;
-}
-
-DLEFT_TEMPLATE
-auto DLEFT_TYPE::StashBucket::EraseMajorOverflow(const K &key, uint32_t hash) -> bool {
-	uint8_t idx = FindMajorOverflowIdx(key, hash);
-	if (idx == invalid_pos) {
-		return false;
-	}
-	CLEAR_BIT_256(validity_, position_[idx]);
-	position_[idx] = invalid_pos;
-	return true;
-}
-
-DLEFT_TEMPLATE
-auto DLEFT_TYPE::StashBucket::FindMajorOverflow(const K &key, V *value, uint32_t hash) const -> bool {
-	uint8_t idx = FindMajorOverflowIdx(key, hash);
-	if (idx == invalid_pos) {
-		return false;
-	}
-	if (value != nullptr) {
-		*value = tuples_[position_[idx]].value;
-	}
-	return true;
-}
-
-DLEFT_TEMPLATE
-auto DLEFT_TYPE::StashBucket::FindMajorOverflowIdx(const K &key, uint32_t hash) const -> uint8_t {
-	uint8_t idx;
-
-	if (position_[0] != invalid_pos && fingerprints_[0] == FINGERPRINT16(hash)) {
-		if (LIKELY( tuples_[position_[0]].key == key )) {
-			return 0;
-		}
-   #ifdef __COUNT_FALSE_POSITIVES__
-		false_positive++;
-   #endif
-	}
-	if (position_[1] != invalid_pos && fingerprints_[1] == FINGERPRINT16(hash)) {
-		if (LIKELY( tuples_[position_[1]].key == key )) {
-			return 1;
-		}
-	 #ifdef __COUNT_FALSE_POSITIVES__
-		false_positive++;
-	 #endif
-	}
-	return invalid_pos;
-}
-
-DLEFT_TEMPLATE
-auto DLEFT_TYPE::StashBucket::InsertMinorOverflow(K &&key, V &&value) -> uint8_t {
-	uint8_t pos;
-
-	// Find an empty slot and insert
-	if ((pos = FindFreeSlot()) == invalid_pos) {
-		return invalid_pos;
-	}
-	tuples_[pos].key = key;
-	tuples_[pos].value = value;
-	SET_BIT_256(validity_, pos);
- #ifdef __COUNT_OVERFLOWS__
-	minor_overflows++;
- #endif
-
-	return pos;
-}
-
-DLEFT_TEMPLATE
-auto DLEFT_TYPE::StashBucket::EraseMinorOverflow(const K &key, uint8_t pos) -> bool {
-	assert(GET_BIT_256(validity_, pos));
-	if (LIKELY( tuples_[pos].key == key )) {
-		CLEAR_BIT_256(validity_, pos);
-		return true;
-	}
-	return false;
-}
-
-DLEFT_TEMPLATE
-auto DLEFT_TYPE::StashBucket::FindMinorOverflow(const K &key, V *value, uint8_t pos) const -> bool {
-	assert(GET_BIT_256(validity_, pos));
-	if (LIKELY( tuples_[pos].key == key )) {
-		if (value != nullptr) {
-			*value = tuples_[pos].value;
-		}
-		return true;
-	}
-	return false;
-}
-
 #ifdef __TEST_DLEFT__
 
 #include "xxhash.h"
@@ -1002,21 +934,19 @@ class DleftTest {
     TestDleft();
 	}
  private:
-	static constexpr uint32_t seed1 = 0x5d445e6e;
-	static constexpr uint32_t seed2 = 0xf09ad611;
+	static constexpr uint64_t seed = 0x42ae2f8ce193f9da;
 
 	template<class K, uint64_t seed>
-	class Hasher {
-	public:
-		auto operator()(const K &key) const -> uint32_t {
-			return XXH32(&key, sizeof(K), seed);
-		}
-	};
+  class HasherUll {
+    public:
+    auto operator()(const K &key) const -> uint64_t {
+      return XXH64(&key, sizeof(K), seed);
+    }
+  };
 
-	using Hasher1 = Hasher<uint32_t, seed1>;
-	using Hasher2 = Hasher<uint32_t, seed2>;
+	using Hasher = HasherUll<uint32_t, seed>;
 
-	using DleftType = DleftFpStash<uint32_t, uint32_t, Hasher1, Hasher2>;
+	using DleftType = DleftFpStash<uint32_t, uint32_t, Hasher>;
 
 	static void TestStashBucket() {
     TestStashBucketInsertMinorOverflow();
@@ -1126,9 +1056,9 @@ class DleftTest {
     {
       DleftType::StashBucket bucket;
       for (int i = 0; i < bucket.max_major_overflows; i++) {
-        assert(bucket.AppendMajorOverflow(i, i, Hasher1()(i)));
+        assert(bucket.AppendMajorOverflow(i, i, OFP(Hasher()(i))));
       }
-      assert(!bucket.AppendMajorOverflow(2023u, 2023u, static_cast<uint16_t>(Hasher1()(2023u))));
+      assert(!bucket.AppendMajorOverflow(2023u, 2023u, OFP(Hasher()(2023u))));
     }
     {
       DleftType::StashBucket bucket;
@@ -1137,9 +1067,9 @@ class DleftTest {
         assert(bucket.InsertMinorOverflow(i, i) != bucket.invalid_pos);
       }
       for (int i = bucket.bucket_capacity - bucket.max_major_overflows / 2; i < bucket.bucket_capacity; i++) {
-        assert(bucket.AppendMajorOverflow(i, i, Hasher1()(i)));
+        assert(bucket.AppendMajorOverflow(i, i, OFP(Hasher()(i))));
       }
-      assert(!bucket.AppendMajorOverflow(2023u, 2023u, static_cast<uint16_t>(Hasher1()(2023u))));
+      assert(!bucket.AppendMajorOverflow(2023u, 2023u, OFP(Hasher()(2023u))));
     }
 
     printf("[PASSED]\n");
@@ -1151,16 +1081,16 @@ class DleftTest {
     DleftType::StashBucket bucket;
 
     for (int i = 0; i < bucket.max_major_overflows; i++) {
-      assert(bucket.AppendMajorOverflow(i, i, Hasher1()(i)));
+      assert(bucket.AppendMajorOverflow(i, i, OFP(Hasher()(i))));
     }
 
     for (int i = 0; i < bucket.max_major_overflows; i += 2) {
-      assert(bucket.EraseMajorOverflow(i, Hasher1()(i)));
-      assert(!bucket.EraseMajorOverflow(i, Hasher1()(i)));
+      assert(bucket.EraseMajorOverflow(i, OFP(Hasher()(i))));
+      assert(!bucket.EraseMajorOverflow(i, OFP(Hasher()(i))));
     }
 
     for (int i = 0; i < bucket.max_major_overflows; i += 2) {
-      assert(bucket.AppendMajorOverflow(i, i, Hasher1()(i)));
+      assert(bucket.AppendMajorOverflow(i, i, OFP(Hasher()(i))));
     }
 
     printf("[PASSED]\n");
@@ -1172,24 +1102,24 @@ class DleftTest {
     DleftType::StashBucket bucket;
 
     for (int i = 0; i < bucket.max_major_overflows; i++) {
-      assert(bucket.AppendMajorOverflow(i, i, Hasher1()(i)));
+      assert(bucket.AppendMajorOverflow(i, i, OFP(Hasher()(i))));
     }
     for (int i = 0; i < bucket.max_major_overflows; i++) {
       uint32_t value;
-      assert(bucket.FindMajorOverflow(i, &value, Hasher1()(i)));
-      assert(!bucket.FindMajorOverflow(i+1, &value, Hasher1()(i)));
+      assert(bucket.FindMajorOverflow(i, &value, OFP(Hasher()(i))));
+      assert(!bucket.FindMajorOverflow(i+1, &value, OFP(Hasher()(i))));
       assert(value == i);
     }
 
     for (int i = 0; i < bucket.max_major_overflows; i += 2) {
-      assert(bucket.EraseMajorOverflow(i, Hasher1()(i)));
-      assert(!bucket.FindMajorOverflow(i, nullptr, Hasher1()(i)));
+      assert(bucket.EraseMajorOverflow(i, OFP(Hasher()(i))));
+      assert(!bucket.FindMajorOverflow(i, nullptr, OFP(Hasher()(i))));
     }
 
     for (int i = bucket.max_major_overflows - 2; i >= 0; i -= 2) {
       uint32_t value;
-      assert(bucket.AppendMajorOverflow(i, i*2, Hasher1()(i)));
-      assert(bucket.FindMajorOverflow(i, &value, Hasher1()(i)));
+      assert(bucket.AppendMajorOverflow(i, i*2, OFP(Hasher()(i))));
+      assert(bucket.FindMajorOverflow(i, &value, OFP(Hasher()(i))));
       assert(value == i*2);
     }
 
@@ -1202,14 +1132,14 @@ class DleftTest {
     DleftType::StashBucket bucket;
 
     for (int i = 0; i < bucket.max_major_overflows; i++) {
-      assert(bucket.AppendMajorOverflow(i, i, Hasher1()(i)));
+      assert(bucket.AppendMajorOverflow(i, i, OFP(Hasher()(i))));
     }
     for (int i = 0; i < bucket.max_major_overflows; i += 2) {
-      assert(bucket.InsertMajorOverflow(i, i*2, Hasher1()(i)));
+      assert(bucket.InsertMajorOverflow(i, i*2, OFP(Hasher()(i))));
     }
     for (int i = 0; i < bucket.max_major_overflows; i += 2) {
       uint32_t value;
-      assert(bucket.FindMajorOverflow(i, &value, Hasher1()(i)));
+      assert(bucket.FindMajorOverflow(i, &value, OFP(Hasher()(i))));
       if (i % 2 == 0) {
         assert(value == i*2);
       } else {
@@ -1226,9 +1156,9 @@ class DleftTest {
     DleftType::Bucket bucket;
 
     for (int i = 0; i < bucket.bucket_capacity; i++) {
-      assert(bucket.Append(i, i, Hasher1()(i), nullptr));
+      assert(bucket.Append(i, i, OFP(Hasher()(i)), nullptr));
     }
-    assert(!bucket.Append(2023u, 2023u, Hasher1()(2023u), nullptr));
+    assert(!bucket.Append(2023u, 2023u, OFP(Hasher()(2023u)), nullptr));
 
     printf("[PASSED]\n");
   }
@@ -1239,12 +1169,12 @@ class DleftTest {
     DleftType::Bucket bucket;
 
     for (int i = 0; i < bucket.bucket_capacity; i++) {
-      assert(bucket.Append(i, i, Hasher1()(i), nullptr));
+      assert(bucket.Append(i, i, OFP(Hasher()(i)), nullptr));
     }
 
     for (int i = 0; i < bucket.bucket_capacity; i += 2) {
-      assert(bucket.Erase(i, Hasher1()(i), nullptr));
-      assert(!bucket.Erase(i, Hasher1()(i), nullptr));
+      assert(bucket.Erase(i, OFP(Hasher()(i)), nullptr));
+      assert(!bucket.Erase(i, OFP(Hasher()(i)), nullptr));
     }
 
     printf("[PASSED]\n");
@@ -1256,21 +1186,21 @@ class DleftTest {
     DleftType::Bucket bucket;
 
     for (int i = 0; i < bucket.bucket_capacity; i++) {
-      assert(bucket.Append(i, i, Hasher1()(i), nullptr));
+      assert(bucket.Append(i, i, OFP(Hasher()(i)), nullptr));
     }
 
     for (int i = 0; i < bucket.bucket_capacity; i += 2) {
       uint32_t value;
-      assert(bucket.Find(i, &value, Hasher1()(i), nullptr));
+      assert(bucket.Find(i, &value, OFP(Hasher()(i)), nullptr));
       assert(value == i);
-      assert(bucket.Erase(i, Hasher1()(i), nullptr));
-      assert(!bucket.Find(i, nullptr, Hasher1()(i), nullptr));
-      assert(bucket.Append(i, i*2, Hasher1()(i), nullptr));
+      assert(bucket.Erase(i, OFP(Hasher()(i)), nullptr));
+      assert(!bucket.Find(i, nullptr, OFP(Hasher()(i)), nullptr));
+      assert(bucket.Append(i, i*2, OFP(Hasher()(i)), nullptr));
     }
 
     for (int i = 0; i < bucket.bucket_capacity; i++) {
       uint32_t value;
-      assert(bucket.Find(i, &value, Hasher1()(i), nullptr));
+      assert(bucket.Find(i, &value, OFP(Hasher()(i)), nullptr));
       if (i % 2 == 0) {
         assert(value == i*2);
       } else {
@@ -1287,16 +1217,16 @@ class DleftTest {
     DleftType::Bucket bucket;
 
     for (int i = 0; i < bucket.bucket_capacity; i++) {
-      assert(bucket.Append(i, i, Hasher1()(i), nullptr));
+      assert(bucket.Append(i, i, OFP(Hasher()(i)), nullptr));
     }
 
     for (int i = 0; i < bucket.bucket_capacity; i += 2) {
-      assert(bucket.Insert(i, i*2, Hasher1()(i), nullptr));
+      assert(bucket.Insert(i, i*2, OFP(Hasher()(i)), nullptr));
     }
 
     for (int i = 0; i < bucket.bucket_capacity; i += 2) {
       uint32_t value;
-      assert(bucket.Find(i, &value, Hasher1()(i), nullptr));
+      assert(bucket.Find(i, &value, OFP(Hasher()(i)), nullptr));
       if (i % 2 == 0) {
         assert(value == i*2);
       } else {
@@ -1314,12 +1244,12 @@ class DleftTest {
     DleftType::StashBucket stash_bucket;
 
     for (int i = 0; i < bucket.bucket_capacity; i++) {
-      assert(bucket.Append(i, i, Hasher1()(i), &stash_bucket));
+      assert(bucket.Append(i, i, OFP(Hasher()(i)), &stash_bucket));
     }
     assert(bucket.overflow_count_ == 0);
 
     for (int i = bucket.bucket_capacity; i < bucket.bucket_capacity + bucket.max_minor_overflows; i++) {
-      assert(bucket.Append(i, i, Hasher1()(i), &stash_bucket));
+      assert(bucket.Append(i, i, OFP(Hasher()(i)), &stash_bucket));
     }
     assert(bucket.overflow_count_ == bucket.max_minor_overflows);
     assert(bucket.GetMinorOverflowCount() == bucket.max_minor_overflows);
@@ -1330,7 +1260,7 @@ class DleftTest {
     for (int i = bucket.bucket_capacity + bucket.max_minor_overflows;
          i < bucket.bucket_capacity + bucket.max_minor_overflows + stash_bucket.max_major_overflows;
          i++) {
-      assert(bucket.Append(i, i, Hasher1()(i), &stash_bucket));
+      assert(bucket.Append(i, i, OFP(Hasher()(i)), &stash_bucket));
     }
     assert(bucket.overflow_count_ == bucket.max_minor_overflows + stash_bucket.max_major_overflows);
     assert(bucket.GetMinorOverflowCount() == bucket.max_minor_overflows);
@@ -1338,7 +1268,7 @@ class DleftTest {
       assert(stash_bucket.position_[i] != stash_bucket.invalid_pos);
     }
   
-    assert(!bucket.Append(2023u, 2023u, Hasher1()(2023u), &stash_bucket));
+    assert(!bucket.Append(2023u, 2023u, OFP(Hasher()(2023u)), &stash_bucket));
 
     printf("[PASSED]\n");
   }
@@ -1352,7 +1282,7 @@ class DleftTest {
     for (int i = 0;
          i < bucket.bucket_capacity + bucket.max_minor_overflows + stash_bucket.max_major_overflows;
          i++) {
-      assert(bucket.Append(i, i, Hasher1()(i), &stash_bucket));
+      assert(bucket.Append(i, i, OFP(Hasher()(i)), &stash_bucket));
     }
     assert(bucket.overflow_count_ == bucket.max_minor_overflows + stash_bucket.max_major_overflows);
     assert(bucket.GetMinorOverflowCount() == bucket.max_minor_overflows);
@@ -1361,16 +1291,16 @@ class DleftTest {
     }
 
     for (int i = 0; i < bucket.bucket_capacity; i++) {
-      assert(bucket.Erase(i, Hasher1()(i), &stash_bucket));
-      assert(!bucket.Erase(i, Hasher1()(i), &stash_bucket));
+      assert(bucket.Erase(i, OFP(Hasher()(i)), &stash_bucket));
+      assert(!bucket.Erase(i, OFP(Hasher()(i)), &stash_bucket));
     }
     assert(bucket.GetSize() == 0);
 
     for (int i = bucket.bucket_capacity + bucket.max_minor_overflows;
          i < bucket.bucket_capacity + bucket.max_minor_overflows + stash_bucket.max_major_overflows;
          i++) {
-      assert(bucket.Erase(i, Hasher1()(i), &stash_bucket));
-      assert(!bucket.Erase(i, Hasher1()(i), &stash_bucket));
+      assert(bucket.Erase(i, OFP(Hasher()(i)), &stash_bucket));
+      assert(!bucket.Erase(i, OFP(Hasher()(i)), &stash_bucket));
     }
     assert(bucket.overflow_count_ == bucket.max_minor_overflows);
     assert(bucket.GetMinorOverflowCount() == bucket.max_minor_overflows);
@@ -1379,8 +1309,8 @@ class DleftTest {
     }
 
     for (int i = bucket.bucket_capacity; i < bucket.bucket_capacity + bucket.max_minor_overflows; i++) {
-      assert(bucket.Erase(i, Hasher1()(i), &stash_bucket));
-      assert(!bucket.Erase(i, Hasher1()(i), &stash_bucket));
+      assert(bucket.Erase(i, OFP(Hasher()(i)), &stash_bucket));
+      assert(!bucket.Erase(i, OFP(Hasher()(i)), &stash_bucket));
     }
     assert(bucket.overflow_count_ == 0);
     assert(bucket.GetMinorOverflowCount() == 0);
@@ -1397,7 +1327,7 @@ class DleftTest {
     for (int i = 0;
          i < bucket.bucket_capacity + bucket.max_minor_overflows + stash_bucket.max_major_overflows;
          i++) {
-      assert(bucket.Append(i, i, Hasher1()(i), &stash_bucket));
+      assert(bucket.Append(i, i, OFP(Hasher()(i)), &stash_bucket));
     }
     assert(bucket.overflow_count_ == bucket.max_minor_overflows + stash_bucket.max_major_overflows);
     assert(bucket.GetMinorOverflowCount() == bucket.max_minor_overflows);
@@ -1409,14 +1339,14 @@ class DleftTest {
          i < bucket.bucket_capacity + bucket.max_minor_overflows + stash_bucket.max_major_overflows;
          i++) {
       uint32_t value;
-      assert(bucket.Find(i, &value, Hasher1()(i), &stash_bucket));
+      assert(bucket.Find(i, &value, OFP(Hasher()(i)), &stash_bucket));
       assert(value == i);
       
-      assert(bucket.Erase(i, Hasher1()(i), &stash_bucket));
-      assert(!bucket.Find(i, nullptr, Hasher1()(i), &stash_bucket));
+      assert(bucket.Erase(i, OFP(Hasher()(i)), &stash_bucket));
+      assert(!bucket.Find(i, nullptr, OFP(Hasher()(i)), &stash_bucket));
 
-      assert(bucket.Append(i, i*2, Hasher1()(i), &stash_bucket));
-      assert(bucket.Find(i, &value, Hasher1()(i), &stash_bucket));
+      assert(bucket.Append(i, i*2, OFP(Hasher()(i)), &stash_bucket));
+      assert(bucket.Find(i, &value, OFP(Hasher()(i)), &stash_bucket));
       assert(value == i*2);
     }
 
@@ -1432,20 +1362,20 @@ class DleftTest {
     for (int i = 0;
          i < bucket.bucket_capacity + bucket.max_minor_overflows + stash_bucket.max_major_overflows;
          i++) {
-      assert(bucket.Append(i, i, Hasher1()(i), &stash_bucket));
+      assert(bucket.Append(i, i, OFP(Hasher()(i)), &stash_bucket));
     }
 
     for (int i = 0;
          i < bucket.bucket_capacity + bucket.max_minor_overflows + stash_bucket.max_major_overflows;
          i += 2) {
-      assert(bucket.Insert(i, i*2, Hasher1()(i), &stash_bucket));
+      assert(bucket.Insert(i, i*2, OFP(Hasher()(i)), &stash_bucket));
     }
 
     for (int i = 0;
          i < bucket.bucket_capacity + bucket.max_minor_overflows + stash_bucket.max_major_overflows;
          i += 2) {
       uint32_t value;
-      assert(bucket.Find(i, &value, Hasher1()(i), &stash_bucket));
+      assert(bucket.Find(i, &value, OFP(Hasher()(i)), &stash_bucket));
       if (i % 2 == 0) {
         assert(value == i*2);
       } else {
@@ -1463,7 +1393,7 @@ class DleftTest {
     DleftType hash_table(testcase_size);
 
     for (int i = 0; i < testcase_size; i++) {
-      assert(hash_table.Append(i, i, Hasher1()(i), Hasher2()(i)));
+      assert(hash_table.Append(i, i, Hasher()(i)));
       assert(hash_table.size_ == i + 1);
     }
 
@@ -1477,17 +1407,17 @@ class DleftTest {
     DleftType hash_table(testcase_size);
 
     for (int i = 0; i < testcase_size; i++) {
-      assert(hash_table.Append(i, i, Hasher1()(i), Hasher2()(i)));
+      assert(hash_table.Append(i, i, Hasher()(i)));
     }
     assert(hash_table.size_ == testcase_size);
 
     for (int i = 0; i < testcase_size; i += 2) {
-      assert(hash_table.Erase(i, Hasher1()(i), Hasher2()(i)));
+      assert(hash_table.Erase(i, Hasher()(i)));
       assert(hash_table.size_ == testcase_size - i / 2 - 1);
     }
 
     for (int i = 0; i < testcase_size; i += 2) {
-      assert(!hash_table.Erase(i, Hasher1()(i), Hasher2()(i)));
+      assert(!hash_table.Erase(i, Hasher()(i)));
       assert(hash_table.size_ == testcase_size / 2);
     }
 
@@ -1501,23 +1431,23 @@ class DleftTest {
     DleftType hash_table(testcase_size);
 
     for (int i = 0; i < testcase_size; i++) {
-      assert(hash_table.Append(i, i, Hasher1()(i), Hasher2()(i)));
+      assert(hash_table.Append(i, i, Hasher()(i)));
     }
 
     for (int i = 0; i < testcase_size; i++) {
       uint32_t value;
-      assert(hash_table.Find(i, &value, Hasher1()(i), Hasher2()(i)));
+      assert(hash_table.Find(i, &value, Hasher()(i)));
       assert(value == i);
     }
 
     for (int i = 0; i < testcase_size; i += 2) {
-      assert(hash_table.Erase(i, Hasher1()(i), Hasher2()(i)));
-      assert(hash_table.Append(i, i*2, Hasher1()(i), Hasher2()(i)));
+      assert(hash_table.Erase(i, Hasher()(i)));
+      assert(hash_table.Append(i, i*2, Hasher()(i)));
     }
 
     for (int i = 0; i < testcase_size; i++) {
       uint32_t value;
-      assert(hash_table.Find(i, &value, Hasher1()(i), Hasher2()(i)));
+      assert(hash_table.Find(i, &value, Hasher()(i)));
       if (i % 2 == 0) {
         assert(value == i*2);
       } else {
@@ -1535,16 +1465,16 @@ class DleftTest {
     DleftType hash_table(testcase_size);
 
     for (int i = 0; i < testcase_size; i++) {
-      assert(hash_table.Append(i, i, Hasher1()(i), Hasher2()(i)));
+      assert(hash_table.Append(i, i, Hasher()(i)));
     }
 
     for (int i = 0; i < testcase_size; i += 2) {
-      assert(hash_table.Insert(i, i*2, Hasher1()(i), Hasher2()(i)) == DleftType::InsertStatus::EXISTED);
+      assert(hash_table.Insert(i, i*2, Hasher()(i)) == DleftType::InsertStatus::EXISTED);
     }
 
     for (int i = 0; i < testcase_size; i++) {
       uint32_t value;
-      assert(hash_table.Find(i, &value, Hasher1()(i), Hasher2()(i)));
+      assert(hash_table.Find(i, &value, Hasher()(i)));
       if (i % 2 == 0) {
         assert(value == i*2);
       } else {
@@ -1562,12 +1492,12 @@ class DleftTest {
     DleftType hash_table(testcase_size);
 
     for (int i = 0; i < testcase_size; i++) {
-      assert(hash_table.Append(i, i, Hasher1()(i), Hasher2()(i)));
+      assert(hash_table.Append(i, i, Hasher()(i)));
     }
 
     for (int i = 0; i < testcase_size; i++) {
       uint32_t value;
-      assert(hash_table.Find(i, &value, Hasher1()(i), Hasher2()(i)));
+      assert(hash_table.Find(i, &value, Hasher()(i)));
       assert(value == i);
     }
 
@@ -1575,7 +1505,7 @@ class DleftTest {
 
     for (int i = 0; i < testcase_size; i++) {
       uint32_t value;
-      assert(hash_table.Find(i, &value, Hasher1()(i), Hasher2()(i)));
+      assert(hash_table.Find(i, &value, Hasher()(i)));
       assert(value == i);
     }
 
@@ -1616,7 +1546,7 @@ class DleftTest {
 	 #endif
 
     uint32_t key = 0;
-    while (hash_table.Append(std::forward<uint32_t>(key), std::forward<uint32_t>(key), Hasher1()(key), Hasher2()(key))) {
+    while (hash_table.Append(std::forward<uint32_t>(key), std::forward<uint32_t>(key), Hasher()(key))) {
       key++;
     }
 
@@ -1652,11 +1582,10 @@ class DleftTest {
 
 #undef __DEBUG_DLEFT__
 #undef DEBUG_DLEFT
-#undef DLEFT_TYPE
 #undef UNLIKELY
 #undef LIKELY
-#undef FINGERPRINT16
-#undef FINGERPRINT8
+#undef OFP
+#undef FP
 #undef GET_BIT
 #undef SET_BIT
 #undef CLEAR_BIT
