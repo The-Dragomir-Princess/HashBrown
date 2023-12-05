@@ -18,7 +18,7 @@
 # include <chrono>
 # include <type_traits>
 
-// #define __TEST_PERFORMANCE__
+#define __TEST_PERFORMANCE__
 
 template<class K, class V, class Hasher>
 class std_unordered_map_wrapper {

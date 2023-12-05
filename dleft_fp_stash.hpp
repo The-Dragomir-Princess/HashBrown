@@ -72,26 +72,26 @@
 #include <cassert>
 #include <cstring>
 
-#define __TEST_DLEFT__
-#define __HASH_TABLE_TEST__
-#define __DEBUG_DLEFT__
+// #define __TEST_DLEFT__
+// #define __DEBUG_DLEFT__
 
-#ifdef __DEBUG_DLEFT__
-# define DEBUG_DLEFT(foo) foo
-#else
-# define DEBUG_DLEFT(foo)
-#endif
-
-#define __COUNT_FALSE_POSITIVES__
-#define __COUNT_OVERFLOWS__
+// #define __COUNT_FALSE_POSITIVES__
+// #define __COUNT_OVERFLOWS__
 
 #ifdef __COUNT_FALSE_POSITIVES__
 static uint64_t false_positive{0};
+static uint64_t overflow_false_positives{0};
 #endif
 
 #ifdef __COUNT_OVERFLOWS__
 static uint64_t minor_overflows{0};
 static uint64_t major_overflows{0};
+#endif
+
+#ifdef __DEBUG_DLEFT__
+# define DEBUG_DLEFT(foo) foo
+#else
+# define DEBUG_DLEFT(foo)
 #endif
 
 #define CACHELINE_SIZE (64)
@@ -218,14 +218,16 @@ class DleftFpStash {
     // static constexpr size_t buf_size = CACHELINE_SIZE - header_size;
     // static constexpr int buf_capacity = buf_size / tuple_size;
 
-    // header (32 bytes)
+    // header (36 bytes)
+		// TODO: probably use partial keys instead of fingerprints to further enhance space utilization
     fp_t fingerprints_[bucket_capacity];       // fingerprints for each in-bucket key
     uint16_t validity_{0};                     // validity bitmap for each in-bucket key
 		pos_t overflow_count_{0};                  // the total number of overflows
-		uint8_t overflow_info_{0};                 // the 2 highest bits specify the stash bucket;
+		uint8_t overflow_info_{0};                 // the 4 highest bits specify the stash bucket;
 		                                           // the 4 lowest bits serve as the validity bits for minor overflows
 		ofp_t overflow_fp_[max_minor_overflows];   // fingerprints for minor overflows
 		pos_t overflow_pos_[max_minor_overflows];  // positions of minor overflows in the stash bucket
+		idx_t stash_stride_;
 
 		// TODO: write buffer optimization
     // // write buffer (in the same cacheline as header)
@@ -405,19 +407,27 @@ class DleftFpStash {
 				goto not_found;
 			}
 
-			SEARCH_16_128(fp, overflow_fp_, mask);  // Search minor overflows, again using fingerprints
-			while (mask != 0) {
-				idx = __builtin_ctz(mask) / 2;
-				if (GET_BIT(overflow_info_, idx)) {
-					if (LIKELY( stash_bucket->tuples_[overflow_pos_[idx]].key == key )) {
+			for (int i = 0; i < Bucket::max_minor_overflows; i += 2) {
+				if (GET_BIT(overflow_info_, i) && overflow_fp_[i] == fp) {
+					if (LIKELY( stash_bucket->tuples_[overflow_pos_[i]].key == key )) {
 						status = TupleStatus::MINOR_OVERFLOW;
-						return idx;
+						return i;
 					}
 				 #ifdef __COUNT_FALSE_POSITIVES__
 					false_positive++;
+					overflow_false_positives++;
 				 #endif
 				}
-				mask &= ~(3 << (idx * 2));
+				if (GET_BIT(overflow_info_, i + 1) && overflow_fp_[i + 1] == fp) {
+					if (LIKELY( stash_bucket->tuples_[overflow_pos_[i + 1]].key == key )) {
+						status = TupleStatus::MINOR_OVERFLOW;
+						return i + 1;
+					}
+				 #ifdef __COUNT_FALSE_POSITIVES__
+					false_positive++;
+					overflow_false_positives++;
+				 #endif
+				}
 			}
 
 			if (UNLIKELY( overflow_count_ > GetMinorOverflowCount() )) {  // Search major overflows in stash bucket
@@ -445,13 +455,13 @@ class DleftFpStash {
 		auto GetTotal() const -> pos_t { return GetSize() + overflow_count_; }
 
 		// Get its stash bucket's number (each bucket has at most four candidate stash buckets)
-		auto GetStashBucketNum() const -> uint8_t { return overflow_info_ >> 6; }
+		auto GetStashBucketNum() const -> uint8_t { return overflow_info_ >> 4; }
 
 		// Bind the bucket to a stash bucket; once bound, it cannot be unbounded unless the number of overflows becomes 0
-		void SetStashBucketNum(uint8_t num) { overflow_info_ = (num << 6) | GetMinorOverflowValidity(); }
+		void SetStashBucketNum(uint8_t num) { overflow_info_ = (num << 4) | GetMinorOverflowValidity(); }
 
 		auto GetStashBucketIndex(idx_t idx, idx_t max) const -> size_t {
-			return (idx / BUCKET_STASH_BUCKET_RATIO + GetStashBucketNum() * GetStride(idx)) & (max - 1);
+			return (idx / BUCKET_STASH_BUCKET_RATIO + GetStashBucketNum() * stash_stride_) & (max - 1);
 		}
 
 		// Get the validity bitmap for its moinor overflows
@@ -469,7 +479,7 @@ class DleftFpStash {
 
     // header (40 B)
     ofp_t fingerprints_[max_major_overflows];               // fingerprints for major overflows
-		pos_t  position_[max_major_overflows];                  // positions of each major overflow in stash bucket
+		pos_t position_[max_major_overflows];                  // positions of each major overflow in stash bucket
     uint64_t validity_[ROUND_UP(bucket_capacity, 64)] {0};  // validity bitmap for each overflow key in stash bucket
 
 		// key-value pairs
@@ -551,6 +561,7 @@ class DleftFpStash {
 				}
 			 #ifdef __COUNT_FALSE_POSITIVES__
 				false_positive++;
+				overflow_false_positives++;
 			 #endif
 			}
 			if (position_[1] != invalid_pos && fingerprints_[1] == fp) {
@@ -559,6 +570,7 @@ class DleftFpStash {
 				}
 			 #ifdef __COUNT_FALSE_POSITIVES__
 				false_positive++;
+				overflow_false_positives++;
 			 #endif
 			}
 			return invalid_pos;
@@ -673,19 +685,21 @@ class DleftFpStash {
 			size_t stash_idx = (idx / BUCKET_STASH_BUCKET_RATIO) & (num_stash_buckets_ - 1);
 			uint8_t min_stash_num;
 			pos_t min_stash_size = 0xff;
-			for (uint8_t stash_num = 0; stash_num < 4; stash_num++) {  // Bind bucket to its most underfull candidate stash bucket
-				stash_idx = (stash_idx + GetStride(idx)) & (num_stash_buckets_ - 1);
+			bucket->stash_stride_ = GetStride(idx);
+			for (uint8_t stash_num = 0; stash_num < 16; stash_num++) {  // Bind bucket to its most underfull candidate stash bucket
+				stash_idx = (stash_idx + bucket->stash_stride_) & (num_stash_buckets_ - 1);
 				pos_t size = stash_buckets_[stash_idx].GetSize();
 				if (size < min_stash_size) {
 					min_stash_num = stash_num;
 					min_stash_size = size;
 				}
+				DEBUG_DLEFT( printf("Candidate stash bucket %u of bucket %u: %lu\n", stash_num, idx, stash_idx); )
 			}
 			bucket->SetStashBucketNum(min_stash_num);
 			assert(bucket->GetStashBucketNum() == min_stash_num);
 			DEBUG_DLEFT(
-				printf("Bucket %d bound with stash bucket %lu(%d)\n", idx,
-							bucket->GetStashBucketIndex(idx, num_stash_buckets_), min_stash_num);
+				printf("Bucket %u bound with stash bucket %lu(%u)\n",
+							idx, bucket->GetStashBucketIndex(idx, num_stash_buckets_), min_stash_num);
 			)
 		}
 
@@ -902,7 +916,11 @@ class DleftFpStash {
 
 	auto StashBucketCapacity() const -> size_t { return StashBucket::bucket_capacity * num_stash_buckets_; }
 
-	static auto GetStride(uint16_t idx) -> size_t { return idx * idx + 7 * idx + 457; }
+	static auto GetStride(uint16_t idx) -> idx_t {
+		hash_t hash = H()(idx);
+		return IDX1(hash) ^ IDX2(hash);
+		// return idx * idx + 7 * idx + 457;
+	}
 
 	idx_t num_buckets_;
 
@@ -1526,14 +1544,16 @@ class DleftTest {
 			uint32_t value;
 			hash_table.find(i, value);
 		}
-		printf("Positive Read: %ld false positives\n", false_positive);
+		printf("Positive Read: %lu false positives, %lu of which occured on overflows\n",
+					 false_positive, overflow_false_positives);
 
 		false_positive = 0;
 		for (int i = testcase_size; i < testcase_size * 2; i++) {
 			uint32_t value;
 			hash_table.find(i, value);
 		}
-		printf("Negative Read: %ld false positives\n", false_positive);
+		printf("Negative Read: %lu false positives, %lu of which occured on overflows\n",
+					 false_positive, overflow_false_positives);
 	 #endif
 	}
 
@@ -1560,11 +1580,11 @@ class DleftTest {
       stash_bucket_total += hash_table.stash_buckets_[i].GetSize();
     }
 
-    printf("Bucket Distribution:\n");
+    printf("Bucket Distribution (Total: %u):\n", hash_table.num_buckets_);
     for (auto &p : bucket_distribution) {
       printf("%lu:%lu,", p.first, p.second);
     }
-    printf("\nStash Bucket Distribution:\n");
+    printf("\nStash Bucket Distribution (Total: %u):\n", hash_table.num_stash_buckets_);
     for (auto &p : stash_bucket_distribution) {
       printf("%lu:%lu,", p.first, p.second);
     }
